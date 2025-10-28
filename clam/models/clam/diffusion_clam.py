@@ -4,8 +4,9 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from models.soda.decoder import UNet_decoder
-from models.soda.encoder import Network
+#Hayden
+#from models.soda.decoder import UNet_decoder
+#from models.soda.encoder import Network
 from omegaconf import DictConfig, OmegaConf
 from torch.cuda.amp import autocast as autocast
 from tqdm import tqdm

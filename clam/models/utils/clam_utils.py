@@ -2,8 +2,10 @@ from clam.models.clam.clam import IDM, ContinuousLAM
 from clam.models.clam.diffusion_clam import DiffusionCLAM
 from clam.models.clam.space_time_clam import SpaceTimeCLAM
 from clam.models.clam.transformer_clam import TransformerCLAM, TransformerIDM
-from clam.models.hierarchical_clam.v1 import HierarchicalCLAMv1
-from clam.models.hierarchical_clam.v2 import HierarchicalCLAMv2
+
+#Hayden
+#from clam.models.hierarchical_clam.v1 import HierarchicalCLAMv1
+#from clam.models.hierarchical_clam.v2 import HierarchicalCLAMv2
 
 
 def get_la_dim(cfg):

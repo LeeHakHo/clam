@@ -1,11 +1,13 @@
 # @package _global_
-
 exp_prefix: 'i001'
 exp_dir: '' # gets set in the trainer
 wandb_url: '' # gets set in the trainer
 
 # seed - set to -1 to choose random seed
 seed: 521
+
+#Hayden
+root_dir: 'results'
 
 # wandb configurations
 use_wandb: False
@@ -97,7 +99,7 @@ hydra:
 defaults:
   - env: mujoco
   - data: base
-  - custom
+  #- custom #Hayden
   - override hydra/job_logging: disabled
   - override hydra/launcher: local
   - _self_

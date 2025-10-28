@@ -1,0 +1,70 @@
+#!/bin/bash
+#SBATCH --account=biyik_1165
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-task=p100:2
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#!/bin/bash
+
+
+#conda create -n clam python=3.11
+
+#bash setup.sh
+#pip install -e .
+#pip3 install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+
+# mkdir -p ~/.mujoco
+# cd ~/.mujoco
+# wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz
+# tar -xzf mujoco210-linux-x86_64.tar.gz
+# echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/.mujoco/mujoco210/bin' >> ~/.bashrc
+# echo 'export MUJOCO_PY_MUJOCO_PATH=$HOME/.mujoco/mujoco210' >> ~/.bashrc
+# source ~/.bashrc
+# pip uninstall -y mujoco_py
+# pip install mujoco_py==2.1.2.14
+# python -c "import mujoco_py; print(mujoco_py.__file__)"
+
+#echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home1/hyeonhoo/.mujoco/mujoco210/bin' >> ~/.bashrc
+#source ~/.bashrc
+#echo $LD_LIBRARY_PATH
+
+
+
+#LINE='export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/.mujoco/mujoco210/bin'
+#grep -qxF "$LINE" ~/.bashrc || echo "$LINE" >> ~/.bashrc
+#source ~/.bashrc
+
+
+#conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
+#python -m pip install -U pip
+#python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#python -c "import torch; print(torch.__version__, 'CUDA:', torch.cuda.is_available())"
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate clam
+cd clam
+
+
+#렌더링 모듈 참조
+module purge
+module load legacy/CentOS7
+module load gcc/13.3.0
+module load mesa/24.2.3
+module load mesa-glu/9.0.2
+module load glew/2.2.0
+#export MUJOCO_GL='osmesa' #렌더링안해
+
+nvidia-smi
+#which python
+#which pip
+
+
+python3 main.py --config-name=train_bc \
+    env=metaworld \
+    env.dataset_name=tdmpc2-buffer-imgs \
+    env.datasets=[mw-assembly] \
+    env.env_id=assembly-v2 
+    #root_dir='home1/hyeonhoo/code/clam/clam/outputs'
