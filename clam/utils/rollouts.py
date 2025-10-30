@@ -198,6 +198,8 @@ def rollout_helper(
 
     obs = env.reset()
     if cfg.env.env_name == "metaworld":
+        #Hayden
+        #obs = obs
         obs, info = obs
 
     n_envs = obs.shape[0]

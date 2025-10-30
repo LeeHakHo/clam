@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gpus-per-task=p100:2
+#SBATCH --gpus-per-task=a100:2
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #!/bin/bash
@@ -47,24 +47,49 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate clam
 cd clam
 
-
 #렌더링 모듈 참조
-module purge
-module load legacy/CentOS7
-module load gcc/13.3.0
-module load mesa/24.2.3
-module load mesa-glu/9.0.2
-module load glew/2.2.0
+#module purge
+#module load legacy/CentOS7
+#module load gcc/13.3.0
+#module load mesa/24.2.3
+#module load mesa-glu/9.0.2
+#module load glew/2.2.0
 #export MUJOCO_GL='osmesa' #렌더링안해
+
+
+conda activate clam
 
 nvidia-smi
 #which python
 #which pip
+#echo "--- (1) 현재 Conda 환경 ---"
+#conda info --envs
+#echo "--- (2) 활성화된 파이썬 경로 ---"
+#which python
+#echo "--- (3) 활성화된 pip 경로 ---"
+#which pip
 
 
-python3 main.py --config-name=train_bc \
+#python3 scripts/npz_to_tfds.py \
+#    --root /project/biyik_1165/hyeonhoo/aliangdw_metaworld_metaworld_eval \
+#    --tfds-root /project/biyik_1165/hyeonhoo/tensorflow_datasets \
+#    --dataset-name aliangdw-metaworld \
+#    --task-name metaworld-eval \
+#    --images-as-observations
+
+# python3 main.py --config-name=train_bc \
+#     env=metaworld \
+#     env.dataset_name=aliangdw-metaworld\
+#     env.datasets=[metaworld-train] \
+#     env.env_id=assembly-v2 \
+#     log_rollout_videos=False \
+#     num_eval_rollouts_render=0
+
+python3 main.py --config-name=train_clam \
     env=metaworld \
-    env.dataset_name=tdmpc2-buffer-imgs \
-    env.datasets=[mw-assembly] \
-    env.env_id=assembly-v2 
-    #root_dir='home1/hyeonhoo/code/clam/clam/outputs'
+    env.dataset_name=aliangdw-metaworld\
+    env.datasets=[metaworld-train] \
+    env.env_id=assembly-v2 \
+    joint_action_decoder_training=False \
+    log_rollout_videos=False \
+    num_eval_rollouts_render=0

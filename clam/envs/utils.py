@@ -1,6 +1,7 @@
 from functools import partial
 
 import d4rl
+
 import numpy as np
 from metaworld.envs import ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE
 
@@ -106,8 +107,18 @@ def make_mujoco_envs(num_envs, env_id, **kwargs):
 
 
 def make_metaworld_envs(num_envs, env_id, **kwargs):
+
     import gymnasium as gym
     import metaworld
+
+
+    #Hayden
+    from shimmy import GymV21CompatibilityV0
+    class MetaworldCompatibilityWrapper(GymV21CompatibilityV0):
+        def render(self):
+            # 'mode' 인자 없이 원본 환경의 render()를 직접 호출합니다.
+            return self.gym_env.render()
+
 
     mw_env_id = env_id + "-goal-observable"
     if mw_env_id not in ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE:
@@ -124,8 +135,11 @@ def make_metaworld_envs(num_envs, env_id, **kwargs):
         np.random.seed(env_idx)
 
         # env = env_cls(render_mode="rgb_array", camera_name="corner2")
+        
+        #Hayden
+        #env = env_cls(seed=env_idx, render_mode="rgb_array")
+        env = env_cls(seed=env_idx)
 
-        env = env_cls(seed=env_idx, render_mode="rgb_array")
         # env.camera_name = "corner2"
         # env.model.cam_pos[2] = [0.75, 0.075, 0.7]
 
@@ -136,6 +150,11 @@ def make_metaworld_envs(num_envs, env_id, **kwargs):
         env._freeze_rand_vec = True
         env.seed(env_idx)
         np.random.set_state(st0)
+
+        #Hayden
+        #if you don't have a monitor to display
+        env = MetaworldCompatibilityWrapper(env=env, render_mode=None)
+        #env = MetaworldCompatibilityWrapper(env=env, render_mode="rgb_array")
 
         # add MW wrappers if we are using TDMPC2 code to change camera angle
         # env = TDMPC2MWWrapper(env, image_shape=kwargs["image_shape"])
@@ -158,10 +177,13 @@ def make_metaworld_envs(num_envs, env_id, **kwargs):
         return env
 
     envs = [partial(env_fn, env_idx=i) for i in range(num_envs)]
+    
     if num_envs == 1:
         envs = gym.vector.SyncVectorEnv(envs)
     else:
         envs = gym.vector.AsyncVectorEnv(envs)
+    
+    
     return envs
 
 

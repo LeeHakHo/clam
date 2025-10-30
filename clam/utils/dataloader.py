@@ -11,7 +11,8 @@ from omegaconf import DictConfig, OmegaConf
 
 from clam.utils.logger import log
 
-os.environ["TFDS_DATA_DIR"] = "/scr/shared/prompt_dtla/tensorflow_datasets"
+#os.environ["TFDS_DATA_DIR"] = "/scr/shared/prompt_dtla/tensorflow_datasets"
+os.environ["TFDS_DATA_DIR"] = "/project/biyik_1165/hyeonhoo/tensorflow_datasets"
 
 
 def episode_to_step_custom(episode, size, shift):
@@ -238,6 +239,8 @@ def get_dataloader(
     total_trajs = 0
     ds_to_len = {}
     for ds_name in dataset_names:
+
+
         save_file = data_dir / cfg.env.dataset_name / ds_name
         ds = tf.data.experimental.load(str(save_file))
         log(f"\tdataset name: {ds_name}, num trajs: {len(ds)}")
