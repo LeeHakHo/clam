@@ -25,7 +25,7 @@ action_dim: 4
 # image_shape: [224, 224]
 image_shape: [84, 84]
 
-n_frame_stack: 3
+n_frame_stack: 3 #Hayden 3->1
 action_repeat: 2
 
 defaults:

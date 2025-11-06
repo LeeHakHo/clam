@@ -29,9 +29,12 @@ class ImageObservationWrapper(gymnasium.Wrapper):
         self.observation_space = spaces.Box(
             low=0, high=255, shape=(image_shape[0], image_shape[1], 3), dtype=np.uint8
         )
+
+        #Hayden
         mujoco_renderer = MujocoRenderer(
-            env.model, env.data, DEFAULT_CAMERA_CONFIG, DEFAULT_SIZE, DEFAULT_SIZE
-        )
+            env.model, env.data, DEFAULT_CAMERA_CONFIG, DEFAULT_SIZE, DEFAULT_SIZE)
+        #mujoco_renderer = MujocoRenderer( env.model, env.data, DEFAULT_CAMERA_CONFIG)
+        
         self.env.unwrapped.mujoco_renderer = mujoco_renderer
 
     def reset(self, **kwargs):
@@ -59,6 +62,7 @@ class ImageObservationWrapper(gymnasium.Wrapper):
     def _get_image_obs(self):
         # Render the environment to capture the current image
         image = self.env.render()
+        print("wrappers:", image.shape)
 
         # Resize the image if needed
         if self.image_shape is not None and image.shape[:2] != self.image_shape:
@@ -67,7 +71,6 @@ class ImageObservationWrapper(gymnasium.Wrapper):
             # image = Image.fromarray(image).resize(self.image_shape)
             image = cv2.resize(image, self.image_shape)
             image = np.array(image)
-
         return image
 
 

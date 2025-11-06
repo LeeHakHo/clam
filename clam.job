@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --account=biyik_1165
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu #gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gpus-per-task=a100:2
-#SBATCH --mem=64G
+#SBATCH --gpus-per-task=p100:2
+#SBATCH --mem=100G
 #SBATCH --time=24:00:00
-#!/bin/bash
+#!/bin/bash 
 
 
 #conda create -n clam python=3.11
@@ -45,8 +45,16 @@
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate clam
+#export PYTHONNOUSERSITE=1
 cd clam
+#pip install "git+https://github.com/Farama-Foundation/Metaworld.git@v2.0.0"
 
+#pip uninstall -y torchvision
+#conda uninstall -y torchvision
+#conda install -y -n clam -c pytorch -c nvidia -c conda-forge pytorch==2.5.1 torchvision==0.20.1 pytorch-cuda=12.4
+#pip install sympy==1.13.1
+
+export WANDB_API_KEY="61a1a21df93bbb2da31d41abc3400294b59ba6eb"
 #렌더링 모듈 참조
 #module purge
 #module load legacy/CentOS7
@@ -55,9 +63,7 @@ cd clam
 #module load mesa-glu/9.0.2
 #module load glew/2.2.0
 #export MUJOCO_GL='osmesa' #렌더링안해
-
-
-conda activate clam
+#export MUJOCO_GL=egl
 
 nvidia-smi
 #which python
@@ -85,11 +91,17 @@ nvidia-smi
 #     log_rollout_videos=False \
 #     num_eval_rollouts_render=0
 
-python3 main.py --config-name=train_clam \
+python3 main.py --config-name=train_clam_images \
     env=metaworld \
     env.dataset_name=aliangdw-metaworld\
     env.datasets=[metaworld-train] \
     env.env_id=assembly-v2 \
     joint_action_decoder_training=False \
-    log_rollout_videos=False \
-    num_eval_rollouts_render=0
+    use_wandb=True \
+    env.image_obs=True \
+    model.image_obs=True \
+    data.image_obs=True   \
+    log_rollout_videos=True
+    #run_eval_rollouts=True
+    
+    #num_eval_rollouts_render=0

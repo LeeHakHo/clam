@@ -196,11 +196,15 @@ def rollout_helper(
     # gym version needs to be gym==0.23.1 for this to work
     log(f"running rollouts, log videos: {log_videos}", color="green")
 
+    #Hayden
+    #print(env) <AsyncVectorEnv instance>
     obs = env.reset()
+
     if cfg.env.env_name == "metaworld":
-        #Hayden
-        #obs = obs
         obs, info = obs
+
+    #Hayden
+    #print(obs.shape) #(40,39)
 
     n_envs = obs.shape[0]
 

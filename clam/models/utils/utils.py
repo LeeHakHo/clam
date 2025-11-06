@@ -8,7 +8,9 @@ from PIL import Image
 from torch import nn
 
 from clam.utils.logger import log
-
+#Hayden
+import einops
+import math
 
 @dataclasses.dataclass
 class VQOutput:

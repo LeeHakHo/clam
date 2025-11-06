@@ -11,8 +11,11 @@ from omegaconf import DictConfig, OmegaConf
 
 from clam.utils.logger import log
 
+#Hayden
+import matplotlib.pyplot as plt
+import numpy as np
 #os.environ["TFDS_DATA_DIR"] = "/scr/shared/prompt_dtla/tensorflow_datasets"
-os.environ["TFDS_DATA_DIR"] = "/project/biyik_1165/hyeonhoo/tensorflow_datasets"
+os.environ["TFDS_DATA_DIR"] = "/project2/biyik_1165/hyeonhoo/tensorflow_datasets"
 
 
 def episode_to_step_custom(episode, size, shift):
@@ -315,6 +318,46 @@ def get_dataloader(
             shuffle=shuffle,
             use_pretrained_embeddings=cfg.model.use_pretrained_embeddings,
         )
+    
+    #Hayden
+    # first_dataset_name = dataset_names[0]
+    # dataset_to_debug = train_ds[first_dataset_name]
+    
+    # log(f"--- [DEBUG] '{first_dataset_name}' 데이터셋에서 샘플 배치 1개 추출 시도... ---")
+
+    # # 2. 딕셔너리가 아닌, *데이터셋 객체*에 대해 .take(1)을 호출합니다.
+    # for batch in dataset_to_debug.take(1):
+    #     try:
+    #         # 3. 텐서를 numpy로 변환
+    #         # batch['observations']의 shape은 [BatchSize, SeqLen, ...] 입니다.
+    #         images = batch['observations'].numpy() 
+        
+    #         # 4. 배치의 3번째(인덱스 2) 아이템을 저장합니다.
+    #         #    (배치 크기가 3 이상이라고 가정)
+    #         sample_image = images[2, 1] 
+    #         # 5. (C, H, W) -> (H, W, C)로 축 변환
+    #         sample_image = sample_image.transpose(1, 2, 0)
+
+    #         tf_image = tf.convert_to_tensor(sample_image, dtype=tf.float32) # dtype 중요!
+
+    #         # 6. 이미지를 (254, 254)로 리사이즈
+    #         #    tf.image.resize는 (H, W, C) 형태를 받아서 (target_H, target_W, C)로 반환
+    #         resized_image_tf = tf.image.resize(tf_image, (1024, 1024))
+            
+    #         # 7. NumPy 배열로 다시 변환
+    #         sample_image = resized_image_tf.numpy()
+    #         output_path = "/home1/hyeonhoo/code/clam/debug_sample_1024.png"
+    #         plt.imsave(output_path, sample_image)
+        
+    #         log(f"--- [DEBUG] 디버그 이미지 저장 완료! -> {output_path} ---")
+    #         log(f"--- [DEBUG] 저장된 이미지 Shape: {sample_image.shape} ---")
+
+    #     except Exception as e:
+    #         log(f"--- [DEBUG] 이미지 저장 중 에러 발생: {e} ---")
+    #         log(f"--- [DEBUG] 배치 'observations' Shape: {batch['observations'].shape} ---")
+        
+    #     break 
+    # checkpoint()
 
     log("creating eval datasets")
     # use all the trajectories in the eval dataset

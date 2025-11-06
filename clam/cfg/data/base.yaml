@@ -1,7 +1,7 @@
 hp_name: null
 
 # where is the dataset stored
-data_dir: /project/biyik_1165/hyeonhoo/ #Hayden
+data_dir: /project2/biyik_1165/hyeonhoo/aliangdw-metaworld/ #Hayden
 batch_size: 128
 
 # number of trajectories to use for training

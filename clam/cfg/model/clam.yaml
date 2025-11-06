@@ -5,6 +5,9 @@ context_len: 2
 share_input_encoder: False
 activate_output: ${.fdm.activate_output}
 
+#Hayden
+gaussian_policy: False
+
 idm:
   la_dim: ${model.la_dim}
   context_len: ${model.context_len}

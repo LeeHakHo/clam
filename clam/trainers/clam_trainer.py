@@ -17,6 +17,7 @@ from clam.utils.dataloader import get_dataloader
 from clam.utils.general_utils import to_device, to_numpy
 from clam.utils.logger import log
 
+import matplotlib.pyplot as plt
 
 def get_labelled_dataloader(cfg):
     if cfg.data.labelled_data_type == "trajectory":
@@ -264,6 +265,7 @@ class CLAMTrainer(OfflineTrainer):
         e.g. o_t-1, o_t => o_t+1, we also predict z_t
         which is the latent action between o_t and o_t+1
         """
+
         # reconstructs full sequence if using a transformer model
         if self.use_transformer:
             clam_output = self.model(
@@ -280,7 +282,7 @@ class CLAMTrainer(OfflineTrainer):
             if self.cfg.model.fdm.predict_target_embedding:
                 # compute target embedding for the next observation
                 pass
-            else:
+            else:   
                 # reconstruct the next raw observation
                 obs_gt = batch.observations[:, self.cfg.model.context_len :].squeeze()
 
@@ -293,7 +295,6 @@ class CLAMTrainer(OfflineTrainer):
 
         obs_recon = clam_output.reconstructed_obs
         la = clam_output.la
-
         # make sure the shapes are correct
         assert obs_recon.shape == obs_gt.shape, f"{obs_recon.shape}, {obs_gt.shape}"
 
@@ -457,6 +458,15 @@ class CLAMTrainer(OfflineTrainer):
             # make channel last
             to_vis = einops.rearrange(to_vis, "c h w -> h w c")
             to_vis = to_numpy(to_vis)
+
+            #Hayden
+            # output_path = "/home1/hyeonhoo/code/clam/debug_sample_wandb.png"
+            # obs_gt = einops.rearrange(obs_recon[0], "c h w -> h w c")
+            # img = to_numpy(obs_gt)
+
+            # #to_vis = np.clip(to_vis, 0, 1)
+            # plt.imsave(output_path, img)
+            # checkpoimt()
 
             # plot images
             self.log_to_wandb({"obs_recon_1": wandb.Image(to_vis)}, prefix="images/")

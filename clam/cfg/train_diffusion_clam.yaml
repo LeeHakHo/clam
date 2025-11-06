@@ -37,6 +37,11 @@ hp_name: ${resolve_clam_name:${base_hp_name},${joint_action_decoder_training},${
 defaults:
   - base
   - model: diffusion_clam
+
+  #Hayden
   - modules/encoder: soda
   - modules/decoder: soda
+  #- modules/encoder: transformer
+  #- modules/decoder: transformer
+
   - _self_

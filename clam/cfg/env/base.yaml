@@ -7,7 +7,10 @@ dataset_name: null
 
 # number of parallel envs to run during evaluation time
 num_envs: 20 
+
+#Hayden
 image_obs: null 
+#image_obs: True
 
 # TODO:
 gamma: 0.999

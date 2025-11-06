@@ -111,14 +111,12 @@ def make_metaworld_envs(num_envs, env_id, **kwargs):
     import gymnasium as gym
     import metaworld
 
-
     #Hayden
     from shimmy import GymV21CompatibilityV0
     class MetaworldCompatibilityWrapper(GymV21CompatibilityV0):
         def render(self):
             # 'mode' 인자 없이 원본 환경의 render()를 직접 호출합니다.
             return self.gym_env.render()
-
 
     mw_env_id = env_id + "-goal-observable"
     if mw_env_id not in ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE:
@@ -153,8 +151,9 @@ def make_metaworld_envs(num_envs, env_id, **kwargs):
 
         #Hayden
         #if you don't have a monitor to display
-        env = MetaworldCompatibilityWrapper(env=env, render_mode=None)
-        #env = MetaworldCompatibilityWrapper(env=env, render_mode="rgb_array")
+        #env = MetaworldCompatibilityWrapper(env=env, render_mode=None)
+        env = MetaworldCompatibilityWrapper(env=env, render_mode="rgb_array")
+        
 
         # add MW wrappers if we are using TDMPC2 code to change camera angle
         # env = TDMPC2MWWrapper(env, image_shape=kwargs["image_shape"])
@@ -170,14 +169,17 @@ def make_metaworld_envs(num_envs, env_id, **kwargs):
 
             if kwargs["n_frame_stack"] > 1:
                 env = FrameStackWrapper(env, num_frames=kwargs["n_frame_stack"])
+        #Hayden
+        else:
+            #Hayden for evaluation vector
+            if kwargs["n_frame_stack"] > 1:
+                env = FrameStackWrapper(env, num_frames=kwargs["n_frame_stack"])
 
         if kwargs["action_repeat"] > 1:
             env = ActionRepeatWrapper(env, kwargs["action_repeat"])
-
+            
         return env
-
     envs = [partial(env_fn, env_idx=i) for i in range(num_envs)]
-    
     if num_envs == 1:
         envs = gym.vector.SyncVectorEnv(envs)
     else:

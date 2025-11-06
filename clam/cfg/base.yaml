@@ -11,11 +11,11 @@ root_dir: 'results'
 
 # wandb configurations
 use_wandb: False
-wandb_group: ''
+wandb_group: ${hp_name}
 wandb_name: ${hp_name}
-wandb_entity: 'clvr'
+wandb_entity: ''
 wandb_project: 'clam'
-wandb_notes: ''
+wandb_notes: 'clam_baseline'
 wandb_tags: 
   - 'clam'
 group_name: ''
