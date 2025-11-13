@@ -5,6 +5,10 @@ env_name: null
 env_id: null 
 dataset_name: null
 
+#Hayden
+eval_dataset_name: null
+eval_datasets: null
+
 # number of parallel envs to run during evaluation time
 num_envs: 20 
 

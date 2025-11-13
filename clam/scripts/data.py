@@ -19,7 +19,7 @@ HALFCHEETAH_FEATURES_DICT = {
     "env_state": tf.TensorSpec(shape=(None, 18), dtype=np.float32),
 }
 
-METAWORLD_IMAGE_SIZE = (84, 84, 3)
+METAWORLD_IMAGE_SIZE = (240, 240, 3) #Hayden
 
 METAWORLD_FEATURES_DICT = {
     "observations": tf.TensorSpec(shape=(None, 39), dtype=np.float32),

@@ -90,7 +90,9 @@ hydra:
 
   output_subdir: null
   run:
-    dir: ${root_dir}/results/${name}/${now:%Y-%m-%d}-${now:%H-%M-%S}/${hp_name}
+    #Hayden
+    #dir: ${root_dir}/results/${name}/${now:%Y-%m-%d}-${now:%H-%M-%S}/${hp_name}
+    dir: ${root_dir}/results/${name}/${now:%Y-%m-%d}-${now:%H-%M-%S}
   
   sweep:
     dir: ${root_dir}/results/${name}/${env.env_name}-${env.env_id}/${now:%Y-%m-%d}-${now:%H-%M-%S}

@@ -36,7 +36,7 @@ def use_image_observations(
     x,
     channel_first: bool = False,
     use_pretrained_embeddings: bool = False,
-    image_shape: List[int] = [84, 84],
+    image_shape: List[int] = [224, 224],
 ):
     if "embeddings" in x and use_pretrained_embeddings:
         x["observations"] = x["embeddings"]

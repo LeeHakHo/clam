@@ -125,6 +125,19 @@ class BaseTrainer:
             shuffle=cfg.data.shuffle,
         )
 
+        #Hayden
+        if cfg.env.eval_datasets != "null":
+            log(f"Loading given eval dataset with reusing train datasetloader==============")
+            cfg.env.dataset_name=cfg.env.eval_dataset_name
+            self.eval_ds, _ = get_dataloader(
+            cfg,
+            dataset_names=cfg.env.eval_datasets,
+            dataset_split=cfg.env.dataset_split,
+            shuffle=cfg.data.shuffle,
+        )
+
+
+
         # combine them and uniformly sample from them
         self.train_dataloader = tf.data.Dataset.sample_from_datasets(
             list(self.train_ds.values())
@@ -309,3 +322,5 @@ class BaseTrainer:
             "optimizer": self.optimizer.state_dict(),
         }
         return state_dict
+
+

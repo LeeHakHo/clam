@@ -23,9 +23,10 @@ task_dim: 3
 max_episode_steps: 100
 action_dim: 4
 # image_shape: [224, 224]
-image_shape: [84, 84]
+image_shape: [128, 128]
+#image_shape: [240, 240]
 
-n_frame_stack: 3 #Hayden 3->1
+n_frame_stack: 3
 action_repeat: 2
 
 defaults:

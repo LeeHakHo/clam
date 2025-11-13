@@ -5,7 +5,7 @@ from clam.scripts.data import save_dataset
 import cv2
 
 def parse_args():
-    p = argparse.ArgumentParser("Convert aliangdw_metaworld NPZ → TFDS")
+    p = argparse.ArgumentParser("Convert NPZ → TFDS")
     p.add_argument("--root", required=True, type=Path, help="NPZ가 있는 폴더 (train/eval)")
     p.add_argument("--tfds-root", required=True, type=Path, help="TFDS 루트")
     p.add_argument("--dataset-name", required=True, type=str, help="TFDS 상위 이름")
