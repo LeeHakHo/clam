@@ -4,6 +4,8 @@ hp_name: null
 data_dir: /project2/biyik_1165/hyeonhoo/ #Hayden
 batch_size: 4
 
+use_cache: True #Hayden
+
 # number of trajectories to use for training
 num_trajs: -1
 

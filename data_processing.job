@@ -1,11 +1,10 @@
 #!/bin/bash
 #SBATCH --account=biyik_1165
-#SBATCH --partition=gpu
+#SBATCH --partition=main
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gpus-per-task=v100:2
-#SBATCH --mem=184G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=248G
 #SBATCH --time=12:00:00
 #!/bin/bash 
 
@@ -104,9 +103,9 @@ nvidia-smi
 #     log_rollout_videos=True
 
 python3 scripts/file_processing_v4.py \
-    --root /project2/biyik_1165/hyeonhoo/oxe/train\
+    --root /project2/biyik_1165/hyeonhoo/oxe/eval\
     --tfds-root /project2/biyik_1165/hyeonhoo/tensorflow_datasets/oxe\
-    --dataset-name oxe_train_0.1\
+    --dataset-name oxe_eval_0.1_128\
     --fraction 0.1
     #--task-name oxe-train \
 #python3 scripts/oxe_to_tfds.py 

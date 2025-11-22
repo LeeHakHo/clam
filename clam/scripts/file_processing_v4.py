@@ -30,7 +30,7 @@ def parse_args():
     p.add_argument("--task-filter", type=str, default=None, help='특정 태스크만 (예: "Open the door")')
     p.add_argument("--use-optimal", action="store_true", help="task-filter와 함께 optimal만 선택")
     p.add_argument("--use-successful", action="store_true", help="성공한 궤적만 선택")
-    p.add_argument("--fraction", type=float, default=1.0,
+    p.add_argument("--fraction", type=float, default=0.1,
                    help="각 데이터셋 폴더에서 사용할 비율 (0<fraction<=1). 예: 0.2 = 20%")
     p.add_argument("--seed", type=int, default=42, help="샘플링 시드(폴더명과 xor하여 폴더별 고정)")
     p.add_argument("--no-shuffle", default=True, action="store_true",
@@ -120,7 +120,7 @@ def npz_to_episode(p: Path):
         # 1) images (240x240)
         if has_img:
             imgs = d["frames"]  # (T, H, W, C)
-            target_hw = (240, 240)  # (W, H)
+            target_hw = (128, 128)  # (W, H)
             resized = [cv2.resize(imgs[i], target_hw, interpolation=cv2.INTER_AREA)
                        for i in range(imgs.shape[0])]
             imgs_resized = np.asarray(resized, dtype=np.uint8)
@@ -223,7 +223,7 @@ def convert_one_folder(ds_dir: Path, args: argparse.Namespace):
             "is_first":     tf.TensorSpec(shape=(None,),    dtype=tf.bool),
             "is_last":      tf.TensorSpec(shape=(None,),    dtype=tf.bool),
             "is_terminal":  tf.TensorSpec(shape=(None,),    dtype=tf.bool),
-            "images":       tf.TensorSpec(shape=(None, 240, 240, 3), dtype=tf.uint8),
+            "images":       tf.TensorSpec(shape=(None, 128, 128, 3), dtype=tf.uint8),
         }
 
         def gen_one_folder():

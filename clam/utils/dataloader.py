@@ -14,6 +14,9 @@ from clam.utils.logger import log
 #Hayden
 import matplotlib.pyplot as plt
 import numpy as np
+from typing import List, Optional
+
+
 #os.environ["TFDS_DATA_DIR"] = "/scr/shared/prompt_dtla/tensorflow_datasets"
 os.environ["TFDS_DATA_DIR"] = "/project2/biyik_1165/hyeonhoo/tensorflow_datasets"
 
@@ -119,8 +122,19 @@ def process_dataset(
     """
     ds = ds.filter(filter_fn)
 
+    #Hayden
+    options = tf.data.Options()
+    options.experimental_optimization.apply_default_optimizations = True
+    options.experimental_optimization.map_parallelization = True
+    # 필요하면 threadpool 사이즈도 조정 가능
+    # options.threading.private_threadpool_size = 16
+    ds = ds.with_options(options)
+
+
     # caching the dataset makes it faster in the next iteration
-    ds = ds.cache()
+    #Hayden
+    # if cfg.use_cache:
+    #     ds = ds.cache()
 
     # the buffer size is important for memory usage
     # and affects the speed
@@ -131,6 +145,11 @@ def process_dataset(
     # limit the number of trajectories that we use
     ds = ds.take(cfg.num_trajs)
     log(f"\ttaking {cfg.num_trajs} trajectories")
+
+    #Hayden
+    if cfg.use_cache:
+        print("using cache")
+        ds = ds.cache()
 
     # compute return of the trajectories
     if "rewards" in ds.element_spec:
@@ -148,23 +167,27 @@ def process_dataset(
                 "yellow",
             )
 
-    ds = ds.map(add_new_fields)
+    #ds = ds.map(add_new_fields)
+    ds = ds.map(add_new_fields, num_parallel_calls=tf.data.AUTOTUNE)
+
 
     # replace observations with images
     if cfg.image_obs:
         log("replace observations with images", "yellow")
-        # we want to convert from [H, W, C] to [C, H, W]
         ds = ds.map(
             partial(
                 use_image_observations,
                 channel_first=True,
                 use_pretrained_embeddings=use_pretrained_embeddings,
                 image_shape=cfg.image_shape,
-            )
+            ),
+            num_parallel_calls=tf.data.AUTOTUNE,
         )
     else:
-        ds = ds.map(partial(process_state, cfg=cfg, env_name=env_name))
-
+        ds = ds.map(
+            partial(process_state, cfg=cfg, env_name=env_name),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
     # maybe pad the dataset here
     if cfg.pad_dataset:
         # TODO: what happens if we use transitions here
@@ -180,7 +203,10 @@ def process_dataset(
         # padding needed when we use shift
         # pad = repeat_padding(pad, cfg.seq_len - 1)
         pad = repeat_padding(pad, 5)
-        ds = ds.map(partial(pad_dataset, pad=pad))
+        #Hayden
+        #ds = ds.map(partial(pad_dataset, pad=pad))
+        ds = ds.map(partial(pad_dataset, pad=pad), num_parallel_calls=tf.data.AUTOTUNE)
+
 
     # quick assert
 
@@ -207,11 +233,17 @@ def process_dataset(
         ds = ds.take(cfg.num_examples)
 
         # recommended to do dataset.take(k).cache().repeat()
-        ds = ds.cache()
+        #ds = ds.cache() #Hayden
+
+    #Hayden
+    # if cfg.use_cache:
+    #     print("using cache")
+    #     ds = ds.cache()
 
     ds = ds.batch(cfg.batch_size, drop_remainder=drop_remainder)
     ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
     return ds
+
 
 
 def get_dataloader(
@@ -219,10 +251,12 @@ def get_dataloader(
     dataset_names: List[str],
     dataset_split: List[int],
     shuffle: bool = True,
+    eval_dataset_names: Optional[List[str]] = None,
 ):
     """
     Returns a dictionary containing the training and validation datasets.
-    Validation dataset is a dictionary of {env_id: dataset}
+    train_ds: {ds_name: tf.data.Dataset}
+    eval_ds : {ds_name: tf.data.Dataset}
     """
     data_cfg = cfg.data
     data_dir = Path(data_cfg.data_dir) / "tensorflow_datasets"
@@ -230,26 +264,34 @@ def get_dataloader(
 
     env_id = cfg.env.env_id
 
+    # ★ train / eval 상위 폴더 분리
+    train_group_name = cfg.env.dataset_name
+    # eval_dataset_name이 따로 있으면 그걸 쓰고, 없으면 train과 동일 폴더 사용
+    eval_group_name = getattr(cfg.env, "eval_dataset_name", train_group_name)
+
+    # --------------------
+    # 0) TRAIN 원본 데이터셋 로드
+    # --------------------
     datasets = {}
     dataset_split = dataset_split[: len(dataset_names)]
-    # convert this into a ratio
     dataset_ratio = [x / sum(dataset_split) for x in dataset_split]
 
     log(
-        f"loading dataset for {env_id}, num datasets: {len(dataset_names)}, ratios: {dataset_ratio}"
+        f"loading TRAIN dataset for {env_id}, "
+        f"group: {train_group_name}, "
+        f"num datasets: {len(dataset_names)}, "
+        f"ratios: {dataset_ratio}"
     )
 
     total_trajs = 0
     ds_to_len = {}
     for ds_name in dataset_names:
-
-
-        save_file = data_dir / cfg.env.dataset_name / ds_name
+        save_file = data_dir / train_group_name / ds_name
         ds = tf.data.experimental.load(str(save_file))
-        log(f"\tdataset name: {ds_name}, num trajs: {len(ds)}")
+        log(f"\t[TRAIN RAW] {ds_name}, num trajs: {len(ds)}")
 
         if data_cfg.load_latent_actions:
-            mapping_file = data_dir / cfg.env.dataset_name / ds_name / "la_map.json"
+            mapping_file = data_dir / train_group_name / ds_name / "la_map.json"
 
             if mapping_file.exists():
                 log(f"Loading latent actions mapping from {mapping_file}", "yellow")
@@ -284,15 +326,17 @@ def get_dataloader(
         total_trajs += len(ds)
         ds_to_len[ds_name] = len(ds)
 
-    log(f"total trajectories: {total_trajs}")
+    log(f"total TRAIN trajectories: {total_trajs}")
     for ds_name in dataset_names:
         log(f"\t{ds_name}: {ds_to_len[ds_name]} trajs")
 
-    # split dataset into train and eval
     train_ds = {}
     eval_ds = {}
 
-    log("split dataset into train and eval: ")
+    # --------------------
+    # 1) TRAIN/EVAL split (eval_dataset_names이 없는 기본 케이스)
+    # --------------------
+    log("split TRAIN dataset into train and eval (base split): ")
     for i, ds_name in enumerate(dataset_names):
         num_take = int(ds_to_len[ds_name] * cfg.data.train_frac)
         num_eval = ds_to_len[ds_name] - num_take
@@ -300,7 +344,10 @@ def get_dataloader(
         train_ds[ds_name] = datasets[ds_name].take(num_take)
         eval_ds[ds_name] = datasets[ds_name].skip(num_take)
 
-    log("creating train datasets")
+    # --------------------
+    # 2) Train dataset 전처리
+    # --------------------
+    log("creating TRAIN datasets (processed)")
     for i, ds_name in enumerate(dataset_names):
         cfg_train = cfg.data.copy()
         if cfg.data.num_trajs != -1:
@@ -309,7 +356,7 @@ def get_dataloader(
             cfg_train.num_examples = int(cfg.data.num_examples * dataset_ratio[i])
 
         log(
-            f"\t{ds_name}: num_trajs: {cfg_train.num_trajs}, num_examples: {cfg_train.num_examples}"
+            f"\t[TRAIN PROC] {ds_name}: num_trajs={cfg_train.num_trajs}, num_examples={cfg_train.num_examples}"
         )
         train_ds[ds_name] = process_dataset(
             cfg_train,
@@ -318,63 +365,83 @@ def get_dataloader(
             shuffle=shuffle,
             use_pretrained_embeddings=cfg.model.use_pretrained_embeddings,
         )
-    
-    #Hayden
-    # first_dataset_name = dataset_names[0]
-    # dataset_to_debug = train_ds[first_dataset_name]
-    
-    # log(f"--- [DEBUG] '{first_dataset_name}' 데이터셋에서 샘플 배치 1개 추출 시도... ---")
 
-    # # 2. 딕셔너리가 아닌, *데이터셋 객체*에 대해 .take(1)을 호출합니다.
-    # for batch in dataset_to_debug.take(1):
-    #     try:
-    #         # 3. 텐서를 numpy로 변환
-    #         # batch['observations']의 shape은 [BatchSize, SeqLen, ...] 입니다.
-    #         images = batch['observations'].numpy() 
-        
-    #         # 4. 배치의 3번째(인덱스 2) 아이템을 저장합니다.
-    #         #    (배치 크기가 3 이상이라고 가정)
-    #         sample_image = images[2, 1] 
-    #         # 5. (C, H, W) -> (H, W, C)로 축 변환
-    #         sample_image = sample_image.transpose(1, 2, 0)
-
-    #         tf_image = tf.convert_to_tensor(sample_image, dtype=tf.float32) # dtype 중요!
-
-    #         # 6. 이미지를 (254, 254)로 리사이즈
-    #         #    tf.image.resize는 (H, W, C) 형태를 받아서 (target_H, target_W, C)로 반환
-    #         resized_image_tf = tf.image.resize(tf_image, (1024, 1024))
-            
-    #         # 7. NumPy 배열로 다시 변환
-    #         sample_image = resized_image_tf.numpy()
-    #         output_path = "/home1/hyeonhoo/code/clam/debug_sample_1024.png"
-    #         plt.imsave(output_path, sample_image)
-        
-    #         log(f"--- [DEBUG] 디버그 이미지 저장 완료! -> {output_path} ---")
-    #         log(f"--- [DEBUG] 저장된 이미지 Shape: {sample_image.shape} ---")
-
-    #     except Exception as e:
-    #         log(f"--- [DEBUG] 이미지 저장 중 에러 발생: {e} ---")
-    #         log(f"--- [DEBUG] 배치 'observations' Shape: {batch['observations'].shape} ---")
-        
-    #     break 
-    # checkpoint()
-
-    log("creating eval datasets")
-    # use all the trajectories in the eval dataset
-    cfg_eval = cfg.data.copy()
-    cfg_eval.num_trajs = -1
-    cfg_eval.num_examples = -1
-    for i, ds_name in enumerate(dataset_names):
-        eval_ds[ds_name] = process_dataset(
-            cfg_eval,
-            eval_ds[ds_name],
-            env_name=cfg.env.env_name,
-            shuffle=False,
-            use_pretrained_embeddings=cfg.model.use_pretrained_embeddings,
+    # --------------------
+    # 3) Eval dataset 전처리
+    #    - eval_dataset_names is None  → TRAIN에서 split한 eval_ds 사용
+    #    - eval_dataset_names 존재     → eval_group_name / eval_dataset_names 기준으로 새로 로드
+    # --------------------
+    if eval_dataset_names is None:
+        log("creating EVAL datasets (from TRAIN split)")
+        cfg_eval = cfg.data.copy()
+        cfg_eval.num_trajs = -1
+        cfg_eval.num_examples = -1
+        for ds_name in dataset_names:
+            log(f"\t[EVAL PROC] {ds_name}: use all split eval trajs/examples")
+            eval_ds[ds_name] = process_dataset(
+                cfg_eval,
+                eval_ds[ds_name],
+                env_name=cfg.env.env_name,
+                shuffle=False,
+                use_pretrained_embeddings=cfg.model.use_pretrained_embeddings,
+            )
+    else:
+        log(
+            f"creating EVAL datasets from separate eval group: {eval_group_name}",
+            "yellow",
         )
+        eval_ds = {}
+        cfg_eval = cfg.data.copy()
+        cfg_eval.num_trajs = -1
+        cfg_eval.num_examples = -1
+
+        for ds_name in eval_dataset_names:
+            save_file = data_dir / eval_group_name / ds_name
+            ds_e = tf.data.experimental.load(str(save_file))
+            log(f"\t[EVAL RAW] {ds_name}, num trajs: {len(ds_e)}")
+
+            if data_cfg.load_latent_actions:
+                mapping_file = data_dir / eval_group_name / ds_name / "la_map.json"
+
+                if mapping_file.exists():
+                    log(f"Loading latent actions mapping from {mapping_file}", "yellow")
+                    with open(mapping_file, "r") as f:
+                        la_map = json.load(f)
+                else:
+                    raise ValueError(
+                        f"Latent actions mapping file not found: {mapping_file}"
+                    )
+
+                if not hasattr(cfg, "lam_ckpt"):
+                    raise ValueError("lam_ckpt not found in config")
+
+                lam_ckpt = cfg.lam_ckpt
+                id_ = la_map[lam_ckpt]
+                la_file = save_file / f"latent_actions_{id_}"
+
+                log(f"Loading latent actions relabelled from {la_file}", "yellow")
+
+                if la_file.exists():
+                    latent_actions_ds = tf.data.experimental.load(str(la_file))
+                else:
+                    raise ValueError(f"Latent actions file not found: {la_file}")
+
+                combined_ds = tf.data.Dataset.zip((ds_e, latent_actions_ds))
+                combined_ds = combined_ds.map(
+                    lambda x, y: {**x, "latent_actions": y["latent_actions"]}
+                )
+                ds_e = combined_ds
+
+            log(f"\t[EVAL PROC] {ds_name}: process all trajs/examples")
+            eval_ds[ds_name] = process_dataset(
+                cfg_eval,
+                ds_e,
+                env_name=cfg.env.env_name,
+                shuffle=False,
+                use_pretrained_embeddings=cfg.model.use_pretrained_embeddings,
+            )
 
     return train_ds, eval_ds
-
 
 if __name__ == "__main__":
     pass

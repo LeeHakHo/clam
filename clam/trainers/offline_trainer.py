@@ -23,7 +23,7 @@ class OfflineTrainer(BaseTrainer):
         self.train_step = 0
 
     def train(self):
-        # first eval
+        #first eval
         if not self.cfg.skip_first_eval:
             self.eval(step=0)
 
@@ -112,30 +112,33 @@ class OfflineTrainer(BaseTrainer):
 
             self.log_to_wandb(metrics, prefix="train/")
 
-            # log stats about the model params
-            param_stats = defaultdict(float)
-            for name, param in self.model.named_parameters():
-                param_stats[f"{name}_mean"] = param.mean().item()
-                param_stats[f"{name}_std"] = param.std().item()
+            #Hayden
+            # #log stats about the model params
+            # param_stats = defaultdict(float)
+            # for name, param in self.model.named_parameters():
+            #     param_stats[f"{name}_mean"] = param.mean().item()
+            #     param_stats[f"{name}_std"] = param.std().item()
 
-            self.log_to_wandb(param_stats, prefix="params/")
+            # self.log_to_wandb(param_stats, prefix="params/")
 
-            # log a step counter for wandb
-            self.log_to_wandb({"_update": self.train_step}, prefix="step/")
+            # #log a step counter for wandb
+            # self.log_to_wandb({"_update": self.train_step}, prefix="step/")
 
             # run evaluation for each evaluation environment
-            if ((self.train_step + 1) % self.eval_every) == 0:
-                self.eval(step=self.train_step + 1)
+            if (not self.cfg.accelerate.use) or self.accelerator.is_main_process: #Hayden
+                if ((self.train_step + 1) % self.eval_every) == 0:
+                    self.eval(step=self.train_step + 1)
 
-                # after eval set model back to train
-                self.model.train()
-                if hasattr(self, "action_decoder"):
-                    self.action_decoder.train()
+                    # after eval set model back to train
+                    self.model.train()
+                    if hasattr(self, "action_decoder"):
+                        self.action_decoder.train()
 
-            # log to terminal
-            if ((self.train_step + 1) % self.cfg.log_terminal_every) == 0:
-                log(f"step: {self.train_step}, train:")
-                log(f"{pretty_repr(metrics)}")
+                # log to terminal
+                if ((self.train_step + 1) % self.cfg.log_terminal_every) == 0:
+                    log(f"step: {self.train_step}, train:")
+                    log(f"{pretty_repr(metrics)}")
+
 
         # final evaluation
         self.eval(step=self.cfg.num_updates)
@@ -151,22 +154,25 @@ class OfflineTrainer(BaseTrainer):
             self.action_decoder.eval()
 
         eval_time = time.time()
-        eval_iter = self.eval_dataloader.as_numpy_iterator()
+        #eval_iter = self.eval_dataloader.as_numpy_iterator()
 
+        #Hayden
         eval_metrics = collections.defaultdict(list)
-        for batch in tqdm.tqdm(
-            eval_iter,
-            desc=f"{self.cfg.name} eval batches",
-        ):
-            # put the batch on the device
-            batch = gutl.to_device(batch, self.device)
+        for _ in range(self.num_eval_batches):
+            batch_np = next(self._eval_iter)
+            batch = gutl.to_device(batch_np, self.device)
             batch = Batch(**batch)
 
             with torch.no_grad():
                 metrics, total_eval_loss = self.compute_loss(batch, train=False)
 
             for k, v in metrics.items():
+                if isinstance(v, torch.Tensor):
+                    # .item()은 Python float을 리턴하므로 메모리를 거의 안 씁니다.
+                    v = v.detach().cpu().item()
                 eval_metrics[k].append(v)
+            del batch
+            del batch_np
 
         # average metrics over all eval batches
         for k, v in eval_metrics.items():

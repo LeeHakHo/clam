@@ -18,6 +18,8 @@ from clam.utils.dataloader import get_dataloader
 from clam.utils.general_utils import omegaconf_to_dict
 from clam.utils.logger import log
 
+from accelerate.utils import DistributedDataParallelKwargs #Hayden
+from tensorflow.data import AUTOTUNE
 
 class BaseTrainer:
     def __init__(self, cfg: DictConfig):
@@ -118,32 +120,35 @@ class BaseTrainer:
 
         log("loading train and eval datasets", "blue")
         # load datasets
-        self.train_ds, self.eval_ds = get_dataloader(
-            cfg,
-            dataset_names=cfg.env.datasets,
-            dataset_split=cfg.env.dataset_split,
-            shuffle=cfg.data.shuffle,
-        )
 
-        #Hayden
+        # Hayden
         if cfg.env.eval_datasets != "null":
-            log(f"Loading given eval dataset with reusing train datasetloader==============")
-            cfg.env.dataset_name=cfg.env.eval_dataset_name
-            self.eval_ds, _ = get_dataloader(
-            cfg,
-            dataset_names=cfg.env.eval_datasets,
-            dataset_split=cfg.env.dataset_split,
-            shuffle=cfg.data.shuffle,
-        )
-
+            # ⚠️ cfg.env.dataset_name 은 건드리지 말자!
+            self.train_ds, self.eval_ds = get_dataloader(
+                cfg,
+                dataset_names=cfg.env.datasets,              # train용
+                dataset_split=cfg.env.dataset_split,
+                shuffle=cfg.data.shuffle,
+                eval_dataset_names=cfg.env.eval_datasets,    # eval용 이름들
+            )
+        else:
+            self.train_ds, self.eval_ds = get_dataloader(
+                cfg,
+                dataset_names=cfg.env.datasets,
+                dataset_split=cfg.env.dataset_split,
+                shuffle=cfg.data.shuffle,
+                # eval_dataset_names=None 이 디폴트
+            )
 
 
         # combine them and uniformly sample from them
-        self.train_dataloader = tf.data.Dataset.sample_from_datasets(
-            list(self.train_ds.values())
+        self.train_dataloader = (
+            tf.data.Dataset.sample_from_datasets(list(self.train_ds.values()))
+            .prefetch(AUTOTUNE)  # 🔹 CPU에서 미리 다음 배치를 준비
         )
-        self.eval_dataloader = tf.data.Dataset.sample_from_datasets(
-            list(self.eval_ds.values())
+        self.eval_dataloader = (
+            tf.data.Dataset.sample_from_datasets(list(self.eval_ds.values()))
+            .prefetch(AUTOTUNE)
         )
 
         # print batch item shapes
@@ -194,12 +199,21 @@ class BaseTrainer:
         log(f"model: {self.model}")
 
         # Initialize Accelerator
+        #Hayden
         if self.cfg.accelerate.use:
             log("Initializing Accelerator", "yellow")
+
+            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True) #Hayden
+
             self.accelerator = Accelerator(
+                kwargs_handlers=[ddp_kwargs], #Hayen
                 mixed_precision="fp16" if self.cfg.accelerate.use_fp16 else "no"
             )
 
+
+            self.device = self.accelerator.device
+            log(f"accelerate device: {self.device}")
+            
             # Prepare model, optimizer, dataloaders
             self.model, self.optimizer, self.train_dataloader, self.eval_dataloader = (
                 self.accelerator.prepare(
@@ -220,6 +234,19 @@ class BaseTrainer:
         else:
             # for mixed precision training
             self.scaler = GradScaler()
+
+        #Hayden
+        tmp_iter = self.eval_dataloader.as_numpy_iterator()
+        num_eval_batches = 0
+        for _ in tmp_iter:
+            num_eval_batches += 1
+        self.num_eval_batches = num_eval_batches
+        log(f"num_eval_batches: {self.num_eval_batches}")
+
+        self.eval_repeat_dataloader = self.eval_dataloader.repeat()
+        self._eval_iter = self.eval_repeat_dataloader.as_numpy_iterator()
+
+
 
         # print model summary
         # if self.cfg.name == "clam" or self.cfg.name == "action_decoder":
@@ -317,8 +344,20 @@ class BaseTrainer:
 
     @property
     def save_dict(self):
+
+        #Hayden
+        # state_dict = {
+        #     "model": self.model.state_dict(),
+        #     "optimizer": self.optimizer.state_dict(),
+        # }
+        # return state_dict
+        if self.cfg.accelerate.use:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+        else:
+            unwrapped_model = self.model
+            
         state_dict = {
-            "model": self.model.state_dict(),
+            "model": unwrapped_model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
         return state_dict

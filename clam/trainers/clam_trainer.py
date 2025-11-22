@@ -78,6 +78,27 @@ class CLAMTrainer(OfflineTrainer):
                 self.labelled_dataloader.repeat().as_numpy_iterator()
             )
 
+        # 비디오용 전용 데이터셋 준비 (ds_name이 고정이라면)
+        self.video_ds_name = "jesbu1_oxe_rfm_eval_oxe_viola_eval"  # 지금 쓰는 그 이름
+        cfg2 = copy.deepcopy(self.cfg)
+        cfg2.data.shuffle = False
+        cfg2.data.batch_size = 1
+        cfg2.data.num_trajs = 1
+        cfg2.data.num_examples = -1
+        cfg2.env.dataset_name = cfg2.env.eval_dataset_name  # ★ eval 상위 폴더로 group 변경
+
+
+        ds_dict, *_ = get_dataloader(
+            cfg=cfg2,
+            dataset_names=[self.video_ds_name],
+            dataset_split=[1],
+            shuffle=False,
+        )
+        # 나중에 계속 재사용할 tf.data.Dataset만 저장
+        self.video_seq_ds = tf.data.Dataset.sample_from_datasets(
+            list(ds_dict.values())
+        )
+
     def setup_action_decoder(self):
         log("---------------------- Initializing Action Decoder ----------------------")
 
@@ -381,28 +402,16 @@ class CLAMTrainer(OfflineTrainer):
         if max_steps is None:
             max_steps = 50
 
-        # 1) 전용(비셔플) 로더 만들기
-        cfg2 = copy.deepcopy(self.cfg)
-        cfg2.data.shuffle = False
-        cfg2.data.batch_size = 1  # b=0 한 샘플만 고정
-        cfg2.data.num_trajs = 1   # 첫 트라젝토리만
-        cfg2.data.num_examples = -1
+        # 1) __init__에서 만든 Dataset 사용
+        #    (지금 예시는 self.video_seq_ds 하나만 있다고 가정)
+        seq_ds = self.video_seq_ds
+        it = seq_ds.as_numpy_iterator()   # 이터레이터는 여기서 매번 새로 생성
 
-        ds_dict, *_ = get_dataloader(
-            cfg=cfg2,
-            dataset_names=[ds_name],
-            dataset_split=[1],   # 단일 ds
-            shuffle=False,
-        )
-        seq_ds = tf.data.Dataset.sample_from_datasets(list(ds_dict.values()))
-        it = seq_ds.as_numpy_iterator()
-
-        # 2) 프레임 생성 루프
         frames = []
         steps = 0
         while steps < max_steps:
             try:
-                batch_np = next(it)  # numpy dict
+                batch_np = next(it)
             except StopIteration:
                 break
 
@@ -604,84 +613,85 @@ class CLAMTrainer(OfflineTrainer):
             # visualize the image reconstructions on eval set
             log("visualizing image reconstructions", "blue")
 
-            # sample a batch
-            eval_iter = self.eval_dataloader.as_numpy_iterator()
-            batch = next(eval_iter)
-            batch = to_device(batch, self.device)
-            batch = Batch(**batch)
+            # # sample a batch
+            # eval_iter = self.eval_dataloader.as_numpy_iterator()
+            # batch = next(eval_iter)
+            # batch = to_device(batch, self.device)
+            # batch = Batch(**batch)
 
-            if self.use_transformer:
-                clam_output = self.model(
-                    batch.observations, timesteps=batch.timestep, states=batch.states
-                )
-                obs_recon = clam_output.reconstructed_obs[:, :-1]
-                obs_gt = batch.observations[:, 1:]
+            # if self.use_transformer:
+            #     clam_output = self.model(
+            #         batch.observations, timesteps=batch.timestep, states=batch.states
+            #     )
+            #     obs_recon = clam_output.reconstructed_obs[:, :-1]
+            #     obs_gt = batch.observations[:, 1:]
 
-                # we will need to flatten the first two dimensions
-                obs_recon = einops.rearrange(obs_recon, "B T C H W -> (B T) C H W")
-                obs_gt = einops.rearrange(obs_gt, "B T C H W -> (B T) C H W")
-            else:
-                clam_output = self.model(batch.observations)
-                obs_recon = clam_output.reconstructed_obs
-                obs_gt = batch.observations[:, -1]
+            #     # we will need to flatten the first two dimensions
+            #     obs_recon = einops.rearrange(obs_recon, "B T C H W -> (B T) C H W")
+            #     obs_gt = einops.rearrange(obs_gt, "B T C H W -> (B T) C H W")
+            # else:
+            #     clam_output = self.model(batch.observations)
+            #     obs_recon = clam_output.reconstructed_obs
+            #     obs_gt = batch.observations[:, -1]
 
-            # wandb expects [B, H, W, C]
-            assert obs_recon.ndim == 4
+            # # wandb expects [B, H, W, C]
+            # assert obs_recon.ndim == 4
 
-            num_exs = 5
-            obs_recon = obs_recon[:num_exs]
-            obs_gt = obs_gt[:num_exs]
+            # num_exs = 5
+            # obs_recon = obs_recon[:num_exs]
+            # obs_gt = obs_gt[:num_exs]
 
-            # if there is framestack, take the last frame
-            if self.cfg.env.n_frame_stack > 1:
-                obs_recon = obs_recon[:, -3:]
-                obs_gt = obs_gt[:, -3:]
+            # # if there is framestack, take the last frame
+            # if self.cfg.env.n_frame_stack > 1:
+            #     obs_recon = obs_recon[:, -3:]
+            #     obs_gt = obs_gt[:, -3:]
 
-            # mix them together
-            to_vis = torch.cat([obs_recon, obs_gt])
-            to_vis = torchvision.utils.make_grid(to_vis, nrow=num_exs)
-            # make channel last
-            to_vis = einops.rearrange(to_vis, "c h w -> h w c")
-            to_vis = to_numpy(to_vis)
+            # # mix them together
+            # to_vis = torch.cat([obs_recon, obs_gt])
+            # to_vis = torchvision.utils.make_grid(to_vis, nrow=num_exs)
+            # # make channel last
+            # to_vis = einops.rearrange(to_vis, "c h w -> h w c")
+            # to_vis = to_numpy(to_vis)
+
+            # #Hayden
+            # # output_path = "/home1/hyeonhoo/code/clam/debug_sample_wandb.png"
+            # # obs_gt = einops.rearrange(obs_recon[0], "c h w -> h w c")
+            # # img = to_numpy(obs_gt)
+
+            # # #to_vis = np.clip(to_vis, 0, 1)
+            # # plt.imsave(output_path, img)
+            # # checkpoimt()
+
+            # # plot images
+            # self.log_to_wandb({"obs_recon_1": wandb.Image(to_vis)}, prefix="images/")
 
             #Hayden
-            # output_path = "/home1/hyeonhoo/code/clam/debug_sample_wandb.png"
-            # obs_gt = einops.rearrange(obs_recon[0], "c h w -> h w c")
-            # img = to_numpy(obs_gt)
 
-            # #to_vis = np.clip(to_vis, 0, 1)
-            # plt.imsave(output_path, img)
-            # checkpoimt()
+            #target1 = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
+            #target1 = "metaworld_eval"
+            # log(f"visualizing image reconstructions - target1={target1}", "blue")
+            # to_vis1 = self.target_vis(self.eval_ds[target1])
+            # self.log_to_wandb({f"obs_recon_target_eval_{target1}": wandb.Image(to_vis1)},
+            #                 prefix="images/")
 
-            # plot images
-            self.log_to_wandb({"obs_recon_1": wandb.Image(to_vis)}, prefix="images/")
+            # target2 = "jesbu1_oxe_rfm_eval_oxe_bridge_v2_eval"
+            # log(f"visualizing image reconstructions - target2={target2}", "blue")
+            # to_vis2 = self.target_vis(self.eval_ds[target2])
+            # self.log_to_wandb({f"obs_recon_target_eval_{target2}": wandb.Image(to_vis2)},
+            #                 prefix="images/")
 
-        #Hayden
+            # target_train = "jesbu1_oxe_rfm_oxe_aloha_mobile"
+            # #target_train = "metaworld_train"
+            # log(f"visualizing image reconstructions - train={target_train}", "blue")
+            # to_vis2 = self.target_vis(self.train_ds[target_train])
+            # self.log_to_wandb({f"obs_recon_target_train_{target_train}": wandb.Image(to_vis2)},
+            #                 prefix="images/")
 
-        target1 = "jesbu1_oxe_rfm_oxe_toto"
-        #target1 = "metaworld_eval"
-        log(f"visualizing image reconstructions - target1={target1}", "blue")
-        to_vis1 = self.target_vis(self.eval_ds[target1])
-        self.log_to_wandb({f"obs_recon_target_eval_{target1}": wandb.Image(to_vis1)},
-                        prefix="images/")
-
-        target2 = "jesbu1_oxe_rfm_eval_oxe_bridge_v2_eval"
-        log(f"visualizing image reconstructions - target2={target2}", "blue")
-        to_vis2 = self.target_vis(self.eval_ds[target2])
-        self.log_to_wandb({f"obs_recon_target_eval_{target2}": wandb.Image(to_vis2)},
-                        prefix="images/")
-
-        target_train = "jesbu1_oxe_rfm_oxe_aloha_mobile"
-        #target_train = "metaworld_train"
-        log(f"visualizing image reconstructions - train={target_train}", "blue")
-        to_vis2 = self.target_vis(self.train_ds[target_train])
-        self.log_to_wandb({f"obs_recon_target_train_{target_train}": wandb.Image(to_vis2)},
-                        prefix="images/")
-
-        path = self.make_episode_video(
-            ds_name="oxe_eval",
-            save_path="results/vis/oxe_eval_ep0.mp4",
-            fps=8,
-            max_steps=50,
-        )
-        log(f"visualizing video = {path}", "blue")
+            video_target = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
+            path = self.make_episode_video(
+                ds_name= video_target,
+                save_path="results/vis/oxe_eval_ep0.mp4",
+                fps=8,
+                max_steps=50,
+            )
+            log(f"visualizing video = {path}", "blue")

@@ -10,7 +10,7 @@ env:
   image_shape: [128, 128] #240/240
 
 data:
-  batch_size: 4 #128
+  batch_size: 2 #128
 
 model:
   context_len: 2
