@@ -5,11 +5,6 @@ NPZ → TFDS converter (per-folder saving / streaming / 240x240 images)
   individually and save to <tfds-root>/<dataset-name>/<task-name>/<ds_dir.name>
 - If root is a dataset folder (frames/ + index_mappings.json), convert only that folder
   and save to <tfds-root>/<dataset-name>/<task-name>/<root.name>
-- If images exist, resize them to 240x240 and save as 'images' (uint8)
-- If observations/actions are missing, create 39D/4D dummy arrays respectively
-- On failure for a file, only print a warning and skip it
-- To prevent OOM: use a generator without accumulating an episodes list →
-  stream save via tf.data.Dataset.save
 """
 
 import argparse, json, sys

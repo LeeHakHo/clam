@@ -2,6 +2,11 @@ num_updates: 200_000
 # log_interval: 100
 name: st_vivit_clam
 
+#Hayden - Customize WanDB name
+base_hp_name: AL-${env.dataset_name}_NT-${num_labelled_trajs}_SN-${seed}
+hp_name: ${resolve_lapa_ckpt_name:${base_hp_name}_${env.hp_name}}
+
+
 action_decoder_bs: 64
 
 env:
@@ -16,7 +21,7 @@ model:
   context_len: 2
   la_dim: 16
   concatenate_gripper_state: False
-  
+
 defaults:
   - train_clam
   - override modules/encoder: st_transformer

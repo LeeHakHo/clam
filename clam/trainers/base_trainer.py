@@ -343,13 +343,7 @@ class BaseTrainer:
     @property
     def save_dict(self):
 
-        #Hayden - Temporarily commented out to speed up training
-        # state_dict = {
-        #     "model": self.model.state_dict(),
-        #     "optimizer": self.optimizer.state_dict(),
-        # }
-        # return state_dict
-        
+        #Hayden
         if self.cfg.accelerate.use:
             unwrapped_model = self.accelerator.unwrap_model(self.model)
         else:
