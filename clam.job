@@ -14,7 +14,6 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate clam
 cd clam
-export WANDB_API_KEY="61a1a21df93bbb2da31d41abc3400294b59ba6eb"
 
 echo "oxe_0.1_128 cahce o 128*128 batch 4 multi-gpu x/  GT action o  GT image o"
 
