@@ -32,7 +32,6 @@ hp_name: ${resolve_clam_name:${base_hp_name},${joint_action_decoder_training},${
 defaults:
   - base
   - model: clam
-  #Haydne mlp->cnn for image_obs
   - modules/encoder: mlp
   - modules/decoder: mlp
   - _self_

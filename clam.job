@@ -4,43 +4,23 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --gpus-per-task=v100:1
+#SBATCH --gpus-per-task=a40:1
 #SBATCH --mem=184G
-#SBATCH --time=08:00:00
+#SBATCH --time=02:00:00
 #!/bin/bash 
 
 #conda create -n clam python=3.11
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate clam
-#export PYTHONNOUSERSITE=1
 cd clam
-export WANDB_API_KEY="61a1a21df93bbb2da31d41abc3400294b59ba6eb"
 
-echo "oxe_0.1_128 캐쉬o 128*128 batch 2 듀얼 x"
+echo "oxe_0.1_128 cahce o 128*128 batch 4 multi-gpu x/  GT action o  GT image o"
 
-nvidia-smi
 
-# python3 main.py --config-name=train_bc \
-#     env=metaworld \
-#     env.dataset_name=aliangdw-metaworld\
-#     env.datasets=[metaworld-train] \
-#     env.env_id=assembly-v2 \
-#     log_rollout_videos=False \
-#     num_eval_rollouts_render=0
+nvidia-smi 
 
-# python3 main.py --config-name=train_st_clam \
-#     env=metaworld \
-#     env.dataset_name=aliangdw-metaworld\
-#     env.datasets=[metaworld-train] \
-#     env.env_id=assembly-v2 \
-#     joint_action_decoder_training=False \
-#     use_wandb=True \
-#     env.image_obs=True \
-#     model.image_obs=True \
-#     data.image_obs=True   \
-#     log_rollout_videos=True
-
+#Train oxe_0.1 dataset with multi-GPU-----------
 
 # accelerate launch --num_processes 2 \
 #     --num_machines 1 \
@@ -62,6 +42,8 @@ nvidia-smi
 #     accelerate.use=True \
 #     accelerate.use_fp16=True
 
+#Train oxe_0.1 dataset-----------
+
 python3 main.py --config-name=train_st_clam \
     env=metaworld \
     env.dataset_name=oxe/oxe_train_0.1_128\
@@ -80,6 +62,8 @@ python3 main.py --config-name=train_st_clam \
     accelerate.use=False \
     accelerate.use_fp16=False
 
+
+#Train metaworld dataset------------
 
 # python3 main.py --config-name=train_st_clam \
 #     env=metaworld \

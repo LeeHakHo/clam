@@ -10,12 +10,12 @@ env:
   image_shape: [128, 128] #240/240
 
 data:
-  batch_size: 2 #128
+  batch_size: 4 #128
 
 model:
   context_len: 2
   la_dim: 16
-  concatenate_gripper_state: True
+  concatenate_gripper_state: False
   
 defaults:
   - train_clam

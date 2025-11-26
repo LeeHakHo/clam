@@ -78,14 +78,14 @@ class CLAMTrainer(OfflineTrainer):
                 self.labelled_dataloader.repeat().as_numpy_iterator()
             )
 
-        # 비디오용 전용 데이터셋 준비 (ds_name이 고정이라면)
-        self.video_ds_name = "jesbu1_oxe_rfm_eval_oxe_viola_eval"  # 지금 쓰는 그 이름
+        # dataset for video
+        self.video_ds_name = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
         cfg2 = copy.deepcopy(self.cfg)
         cfg2.data.shuffle = False
         cfg2.data.batch_size = 1
         cfg2.data.num_trajs = 1
         cfg2.data.num_examples = -1
-        cfg2.env.dataset_name = cfg2.env.eval_dataset_name  # ★ eval 상위 폴더로 group 변경
+        cfg2.env.dataset_name = cfg2.env.eval_dataset_name
 
 
         ds_dict, *_ = get_dataloader(
@@ -94,7 +94,7 @@ class CLAMTrainer(OfflineTrainer):
             dataset_split=[1],
             shuffle=False,
         )
-        # 나중에 계속 재사용할 tf.data.Dataset만 저장
+
         self.video_seq_ds = tf.data.Dataset.sample_from_datasets(
             list(ds_dict.values())
         )
@@ -390,22 +390,117 @@ class CLAMTrainer(OfflineTrainer):
             )
         return state_dict
 
-    #Hayden
+    #Hayden - video reconstruction for ablation experiment
+    @torch.no_grad()
+    def make_episode_video_step(self, ds_name: str, save_path: str, fps: int = 8,
+                        max_steps: int | None = None):
+        import os
+        import imageio
+        
+        if max_steps is None: max_steps = 50
+
+        seq_ds = self.video_seq_ds
+        it = seq_ds.as_numpy_iterator()
+        
+        # n_step data usually overlaps like [t, t+1, t+2]
+        full_gt_seq = []
+        full_gt_states = []
+        
+        print(f"Collecting {max_steps} frames from chopped dataloader...")
+        
+        # Load the first batch (for warm-up, take the whole thing).
+        try:
+            first_batch = next(it)
+            obs_chunk = first_batch['observations'][0]  # (1, T, C, H, W) -> (T, C, H, W)
+            state_chunk = first_batch['states'][0]
+            
+            for i in range(obs_chunk.shape[0]):
+                full_gt_seq.append(torch.tensor(obs_chunk[i]))
+                full_gt_states.append(torch.tensor(statㄴe_chunk[i]))
+                
+        except StopIteration:
+            return None
+
+        # From the second batch onward, loop and collect only the 'last frame'.
+        while len(full_gt_seq) < max_steps + 5: # collect with a small margin
+            try:
+                batch_np = next(it)
+                # Take only the last frame (assuming shift=1)
+                last_obs = torch.tensor(batch_np['observations'][0, -1]) 
+                last_state = torch.tensor(batch_np['states'][0, -1])
+                
+                full_gt_seq.append(last_obs)
+                full_gt_states.append(last_state)
+            except StopIteration:
+                break
+
+        # Convert lists to tensors
+        gt_seq = torch.stack(full_gt_seq).to(self.device)      # (L, C, H, W)
+        gt_states = torch.stack(full_gt_states).to(self.device) # (L, D)
+        
+        # Trim to the desired length
+        gt_seq = gt_seq[:max_steps + 1] 
+        gt_states = gt_states[:max_steps + 1]
+
+        log(f"Manually stitched GT length: {gt_seq.shape[0]}", "green")
+
+
+        recons = self.model.rollout_idm_fdm_closed_loop(
+            gt_seq, gt_states=gt_states, max_steps=max_steps
+        )
+        
+        N = recons.shape[0]
+        if N == 0: return None
+
+        # Visualization and saving 
+        min_len = min(len(recons), len(gt_seq) - 1)
+        recons = recons[:min_len]
+        gt_match = gt_seq[: min_len]
+        N = min_len
+
+        # Visualization loop
+        frames = []
+        device = recons.device
+        dtype  = recons.dtype
+        diff_all = (recons - gt_match).abs().mean(dim=1, keepdim=True)
+        vmax = diff_all.max().clamp(min=1e-8)
+        self._ensure_cmap_lut("magma")
+        self._cmap_lut = self._cmap_lut.to(device=device, dtype=dtype)
+
+        for t in range(N):
+            diff_t = (diff_all[t] / vmax).clamp(0, 1)
+            idx    = (diff_t.squeeze(0) * 255).round().long()
+            diff_rgb = self._cmap_lut[idx].permute(2, 0, 1).contiguous()
+            recon_t = torch.clamp(recons[t],   0, 1)
+            gt_t    = torch.clamp(gt_match[t], 0, 1)
+            tile = torch.stack([diff_rgb, recon_t, gt_t], dim=0)
+            grid = torchvision.utils.make_grid(tile, nrow=3)
+            grid = einops.rearrange(grid, "c h w -> h w c")
+            img  = (torch.clamp(grid, 0, 1).cpu().numpy() * 255).astype(np.uint8)
+            frames.append(img)
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with imageio.get_writer(save_path, format="mp4", fps=fps, codec="libx264", quality=8) as w:
+            for f in frames:
+                w.append_data(f)
+        
+        self.log_to_wandb({f"videos/episode_{ds_name}": wandb.Video(save_path, fps=fps, format="mp4")})
+        return save_path
+
+    #Hayden - video reconstruction
     @torch.no_grad()
     def make_episode_video(self, ds_name: str, save_path: str, fps: int = 8, max_steps: int | None = None):
         """
-        shuffle=False, batch_size=1로 만든 전용 dataloader에서
-        같은 샘플(b=0)의 시간순 윈도우를 이어 붙여
-        [o_t | ŏ_{t+1} | o_{t+1}] 프레임을 생성해 MP4로 저장.
+        From a dedicated dataloader created with shuffle=False, batch_size=1,
+        we stitch together time-ordered windows of the same sample (b=0)
+        to create [o_t | ŏ_{t+1} | o_{t+1}] frames and save them as an MP4.
         """
-        # 0) 비디오 길이 한도
+
         if max_steps is None:
             max_steps = 50
 
-        # 1) __init__에서 만든 Dataset 사용
-        #    (지금 예시는 self.video_seq_ds 하나만 있다고 가정)
         seq_ds = self.video_seq_ds
-        it = seq_ds.as_numpy_iterator()   # 이터레이터는 여기서 매번 새로 생성
+        it = seq_ds.as_numpy_iterator()
 
         frames = []
         steps = 0
@@ -418,7 +513,7 @@ class CLAMTrainer(OfflineTrainer):
             batch = to_device(batch_np, self.device)
             batch = Batch(**batch)
 
-            # 모델 추론 (Transformer 기준: reconstructed_obs가 (B,T-1, C,H,W), GT는 (B,T-1,C,H,W))
+            # Model inference (for Transformer: reconstructed_obs is (B,T-1,C,H,W), GT is (B,T-1,C,H,W))
             if self.use_transformer:
                 out  = self.model(batch.observations, timesteps=batch.timestep, states=batch.states)
                 pred = out.reconstructed_obs[0, :-1]   # (T-1,C,H,W)
@@ -430,17 +525,17 @@ class CLAMTrainer(OfflineTrainer):
                 gt   = batch.observations[0, -1: ]     # (1,C,H,W)
                 cur  = batch.observations[0, -2:-1]    # (1,C,H,W)
 
-            # 프레임스택이면 마지막 RGB만
+            # If frame-stacked, keep only the last RGB channels
             if self.cfg.env.n_frame_stack > 1:
                 C = pred.shape[-3]
                 pred = pred[:, C-3:C]; gt = gt[:, C-3:C]; cur = cur[:, C-3:C]
 
                     
-            # ---- diff 전체 스케일 고정 ----
+            # ---- Fix the overall diff scale ----
             diff_all = (pred - gt).abs().mean(dim=1, keepdim=True)  # (T',1,H,W)
             vmax = diff_all.max().clamp(min=1e-8)
 
-            # LUT 준비 + 디바이스/타입 맞추기 (루프 바깥에서 1회)
+            # Prepare LUT + match device/dtype (once outside the loop)
             self._ensure_cmap_lut("magma")
             device = pred.device
             dtype  = pred.dtype
@@ -452,8 +547,8 @@ class CLAMTrainer(OfflineTrainer):
                 idx    = (diff_t.squeeze(0) * 255).round().long()
                 diff_rgb = self._cmap_lut[idx].permute(2,0,1).contiguous()  # (3,H,W)
 
-                pred_t = torch.clamp(pred[t], 0, 1).to(device=device, dtype=dtype)
-                gt_t   = torch.clamp(gt[t],   0, 1).to(device=device, dtype=dtype)
+                pred_t = (pred[t].clamp(-1, 1) + 1) / 2
+                gt_t   = (gt[t].clamp(-1, 1) + 1) / 2
 
                 tile = torch.stack([diff_rgb, pred_t, gt_t], dim=0)
                 grid = torchvision.utils.make_grid(tile, nrow=3)
@@ -468,7 +563,7 @@ class CLAMTrainer(OfflineTrainer):
             log(f"[make_episode_video] no frames produced for {ds_name}", "yellow")
             return None
 
-        # 3) 저장 + W&B 로깅
+        # 3) Save + log to W&B
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with imageio.get_writer(save_path, format="mp4", fps=fps, codec="libx264", quality=8) as w:
             for f in frames:
@@ -478,9 +573,8 @@ class CLAMTrainer(OfflineTrainer):
         log(f"[make_episode_video] saved: {save_path} (frames={len(frames)}, fps={fps})", "green")
         return save_path
 
-
     def _take_one_batch(self, ds):
-        # TFDS → numpy → torch 로 동일하게 한 배치만
+        # Get a single batch, consistently TFDS → numpy → torch
         it = ds.take(1).as_numpy_iterator()
         batch = next(it)
         batch = to_device(batch, self.device)
@@ -493,68 +587,61 @@ class CLAMTrainer(OfflineTrainer):
 
     @torch.no_grad()
     def target_vis(self, sample_dataloader):
-        # 1) 한 배치에서 한 샘플만 추출
+        # Take a single sample from one batch
         batch = self._take_one_batch(sample_dataloader)
-        b = 0  # 첫 샘플 고정
+        b = 0  # Fix to the first sample
         obs = batch.observations[b]  # (T, C, H, W)
 
-        # 2) 예측 실행
+        # Run prediction
         if self.use_transformer:
             out = self.model(batch.observations, timesteps=batch.timestep, states=batch.states)
-            # 예측은 T-1개: o_t -> o_{t+1}
+            # There are T-1 predictions: o_t -> o_{t+1}
             pred = out.reconstructed_obs[b, :-1]  # (T-1, C, H, W)
             gt   = batch.observations[b, 1:]      # (T-1, C, H, W)
-            cur  = batch.observations[b, :-1]     # (T-1, C, H, W) 현재 프레임 o_t
+            cur  = batch.observations[b, :-1]     # (T-1, C, H, W) current frame o_t
         else:
             out  = self.model(batch.observations)
-            # non-transformer는 next만 1개 내는 구조이므로, 윈도우 마지막 step만 보여줌
             pred = out.reconstructed_obs[b][None]     # (1, C, H, W)
             gt   = batch.observations[b, -1: ]        # (1, C, H, W) = o_{t+1}
             cur  = batch.observations[b, -2:-1]       # (1, C, H, W) = o_t
 
-        # 3) 프레임스택이면 마지막 RGB만 사용
+        # If frame-stacked, use only the last RGB channels
         if self.cfg.env.n_frame_stack > 1:
             C = pred.shape[-3]
             pred = pred[:, C-3:C]; gt = gt[:, C-3:C]; cur = cur[:, C-3:C]
 
 
-        # diff 준비
-        diff = (pred - gt).abs()                       # (T', C, H, W)
-        # 채널 평균으로 스칼라 diff (또는 원하는 방식)
-        diff = diff.mean(dim=1, keepdim=True)          # (T', 1, H, W)
+        # Prepare diff
+        diff = (pred - gt).abs()  
+        diff = diff.mean(dim=1, keepdim=True)
 
-        # LUT 보장
+        # Ensure LUT exists
         self._ensure_cmap_lut("magma")
         device = pred.device
         dtype  = pred.dtype
         self._cmap_lut = self._cmap_lut.to(device=device, dtype=dtype)
 
-
-        # 정규화 범위 (안정적이게)
         eps = 1e-8
-        vmax = diff.max().clamp(min=eps)               # 스칼라 (CUDA)
+        vmax = diff.max().clamp(min=eps) 
 
         tiles = []
         for t in range(pred.shape[0]):
-            # [0,1] 정규화 → 0..255 인덱스
-            diff_t = (diff[t] / vmax).clamp(0, 1)      # (1,H,W)
-            idx = (diff_t.squeeze(0) * 255).round().long()  # (H,W), CUDA
+            # Normalize to [0,1] → 0..255 index
+            diff_t = (diff[t] / vmax).clamp(0, 1) 
+            idx = (diff_t.squeeze(0) * 255).round().long()  
 
-            # GPU LUT로 색 입히기 → (H,W,3) → (3,H,W)
-            diff_rgb = self._cmap_lut[idx]             # (H,W,3) CUDA
-            diff_rgb = diff_rgb.permute(2, 0, 1).contiguous()  # (3,H,W) CUDA
+            diff_rgb = self._cmap_lut[idx] 
+            diff_rgb = diff_rgb.permute(2, 0, 1).contiguous()
 
-            # pred/gt도 0..1로 클램프(이미 CUDA)
             pred_t = torch.clamp(pred[t], 0, 1)
             gt_t   = torch.clamp(gt[t],   0, 1)
 
-            # [diff_rgb | pred | gt]
             tiles += [diff_rgb, pred_t, gt_t]
 
-        grid = torchvision.utils.make_grid(torch.stack(tiles, dim=0), nrow=3)  # CUDA
+        grid = torchvision.utils.make_grid(torch.stack(tiles, dim=0), nrow=3)
         grid = einops.rearrange(grid, "c h w -> h w c")
         grid = torch.clamp(grid, 0, 1)
-        grid = (grid * 255).byte().cpu().numpy()   # 저장/로그 직전에만 CPU로
+        grid = (grid * 255).byte().cpu().numpy()
         return grid
 
 
@@ -613,60 +700,7 @@ class CLAMTrainer(OfflineTrainer):
             # visualize the image reconstructions on eval set
             log("visualizing image reconstructions", "blue")
 
-            # # sample a batch
-            # eval_iter = self.eval_dataloader.as_numpy_iterator()
-            # batch = next(eval_iter)
-            # batch = to_device(batch, self.device)
-            # batch = Batch(**batch)
-
-            # if self.use_transformer:
-            #     clam_output = self.model(
-            #         batch.observations, timesteps=batch.timestep, states=batch.states
-            #     )
-            #     obs_recon = clam_output.reconstructed_obs[:, :-1]
-            #     obs_gt = batch.observations[:, 1:]
-
-            #     # we will need to flatten the first two dimensions
-            #     obs_recon = einops.rearrange(obs_recon, "B T C H W -> (B T) C H W")
-            #     obs_gt = einops.rearrange(obs_gt, "B T C H W -> (B T) C H W")
-            # else:
-            #     clam_output = self.model(batch.observations)
-            #     obs_recon = clam_output.reconstructed_obs
-            #     obs_gt = batch.observations[:, -1]
-
-            # # wandb expects [B, H, W, C]
-            # assert obs_recon.ndim == 4
-
-            # num_exs = 5
-            # obs_recon = obs_recon[:num_exs]
-            # obs_gt = obs_gt[:num_exs]
-
-            # # if there is framestack, take the last frame
-            # if self.cfg.env.n_frame_stack > 1:
-            #     obs_recon = obs_recon[:, -3:]
-            #     obs_gt = obs_gt[:, -3:]
-
-            # # mix them together
-            # to_vis = torch.cat([obs_recon, obs_gt])
-            # to_vis = torchvision.utils.make_grid(to_vis, nrow=num_exs)
-            # # make channel last
-            # to_vis = einops.rearrange(to_vis, "c h w -> h w c")
-            # to_vis = to_numpy(to_vis)
-
-            # #Hayden
-            # # output_path = "/home1/hyeonhoo/code/clam/debug_sample_wandb.png"
-            # # obs_gt = einops.rearrange(obs_recon[0], "c h w -> h w c")
-            # # img = to_numpy(obs_gt)
-
-            # # #to_vis = np.clip(to_vis, 0, 1)
-            # # plt.imsave(output_path, img)
-            # # checkpoimt()
-
-            # # plot images
-            # self.log_to_wandb({"obs_recon_1": wandb.Image(to_vis)}, prefix="images/")
-
-            #Hayden
-
+            #Hayden - image reconstruction
             #target1 = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
             #target1 = "metaworld_eval"
             # log(f"visualizing image reconstructions - target1={target1}", "blue")
@@ -687,8 +721,9 @@ class CLAMTrainer(OfflineTrainer):
             # self.log_to_wandb({f"obs_recon_target_train_{target_train}": wandb.Image(to_vis2)},
             #                 prefix="images/")
 
+            # example video reconstrucion
             video_target = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
-            path = self.make_episode_video(
+            path = self.make_episode_video( # or use self.make_episode_video_step
                 ds_name= video_target,
                 save_path="results/vis/oxe_eval_ep0.mp4",
                 fps=8,

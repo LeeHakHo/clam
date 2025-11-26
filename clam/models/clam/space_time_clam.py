@@ -63,16 +63,16 @@ class SpaceTimeIDM(BaseModel):
 
         self.la_head = nn.Linear(self.model_dim, self.la_dim)
 
-    def forward(
-        self, observations, timesteps: torch.Tensor, states: torch.Tensor, **kwargs
-    ) -> IDMOutput:
-        if self.cfg.quantize_la:
-            vq_cls = get_vq_cls(self.cfg.vq.name)
-            log(f"Using vq {self.cfg.vq.name}", "green")
-            self.cfg.vq.kwargs.dim = self.cfg.la_dim
-            self.vq = vq_cls(**self.cfg.vq.kwargs)
-        else:
-            log("Not using vq, continuous latent action space", "red")
+    # def forward(
+    #     self, observations, timesteps: torch.Tensor, states: torch.Tensor, **kwargs
+    # ) -> IDMOutput:
+    #     if self.cfg.quantize_la:
+    #         vq_cls = get_vq_cls(self.cfg.vq.name)
+    #         log(f"Using vq {self.cfg.vq.name}", "green")
+    #         self.cfg.vq.kwargs.dim = self.cfg.la_dim
+    #         self.vq = vq_cls(**self.cfg.vq.kwargs)
+    #     else:
+    #         log("Not using vq, continuous latent action space", "red")
 
     def forward(
         self, observations, timesteps: torch.Tensor, states: torch.Tensor, **kwargs
@@ -336,3 +336,139 @@ class SpaceTimeCLAM(TransformerCLAM):
         **kwargs,
     ) -> CLAMOutput:
         return super().forward(observations, timesteps=timesteps, states=states)
+
+    #Hayden - ablation experiment for video reconstruction
+    @torch.no_grad()
+    def rollout_idm_fdm_closed_loop(
+        self,
+        gt_seq: torch.Tensor,    # (T, C, H, W)
+        gt_states: torch.Tensor, # (T, D) or None
+        max_steps: int | None = None,
+        ):
+
+        use_gt_image: bool = True   # using all GT image?
+        use_gt_action: bool = True # using action from GT image?
+        use_zero_action: bool = False # reconstruction without latent action
+
+
+        if use_zero_action and use_gt_action:
+            raise ValueError("If use_zero_action=True, it should be use_gt_action=False.")
+
+        # gripper state off
+        self.idm.cfg.concatenate_gripper_state = False
+        self.fdm.cfg.concatenate_gripper_state = False
+
+        device = gt_seq.device
+        T, C, H, W = gt_seq.shape
+
+        # processing max_steps
+        if max_steps is None:
+            max_steps = T - 1
+        else:
+            max_steps = min(max_steps, T - 1)
+
+        recons = []
+
+        def sample_la(idm_out):
+            la = idm_out.la
+            if self.cfg.distributional_la:
+                la = self.model.reparameterize(la)
+            return la
+
+        # -------------------------
+        # 1) Warm-up (step=1): GT 2 frames
+        # -------------------------
+        if max_steps >= 1:
+            pair0 = gt_seq[0:2].unsqueeze(0)                 # (1,2,C,H,W)
+            ts0   = torch.tensor([[0, 1]], device=device)     # (1,2)
+            state0 = None  # or gt_states[0:2].unsqueeze(0)
+
+            idm_out0 = self.idm(observations=pair0,
+                                timesteps=ts0,
+                                states=state0)
+            la0 = sample_la(idm_out0)
+
+            if use_zero_action:
+                la0 = torch.zeros_like(la0)
+
+            idm_step0 = IDMOutput(la=la0, encoder_out=idm_out0.encoder_out)
+
+            recon0 = self.fdm(
+                observations=pair0,
+                idm_output=idm_step0,
+                timesteps=ts0,
+                states=state0,
+            )
+            current_recon = (torch.tanh(recon0[0, -1]) + 1) / 2  # (C,H,W)
+            recons.append(current_recon)
+
+        # -------------------------
+        # 2) Loop: step=2..max_steps
+        # -------------------------
+        for step in range(2, max_steps + 1):
+            t_prev = step - 1
+            t_curr = step
+            ts_pair = torch.tensor([[t_prev, t_curr]], device=device)
+            state_pair = None
+
+            pair_gt = gt_seq[step-2: step].unsqueeze(0)  # (1,2,C,H,W)
+
+            if step == 2:
+                # t=1 (GT) + t=2 (Gen)
+                prev_img = gt_seq[1]
+                curr_img = recons[-1]
+            else:
+                prev_img = recons[-2]
+                curr_img = recons[-1]
+
+            pair_gen = torch.stack([prev_img, curr_img], dim=0).unsqueeze(0)  # (1,2,C,H,W)
+
+            if use_gt_image:
+                pair_for_idm = pair_gt
+            else:
+                pair_for_idm = pair_gen
+
+            idm_out = self.idm(
+                observations=pair_for_idm,
+                timesteps=ts_pair,
+                states=state_pair,
+            )
+
+            if use_zero_action:
+                la_for_fdm = torch.zeros_like(idm_out.la)
+            
+            elif use_gt_action:
+                idm_out_gt = self.idm(
+                    observations=pair_gt,
+                    timesteps=ts_pair,
+                    states=state_pair,
+                )
+                la_for_fdm = sample_la(idm_out_gt)
+                
+            else:
+                # just use la from current pair_for_idm
+                la_for_fdm = sample_la(idm_out)
+
+            idm_step = IDMOutput(
+                la=la_for_fdm,
+                encoder_out=idm_out.encoder_out,
+            )
+
+            recon_next = self.fdm(
+                observations=pair_for_idm,
+                idm_output=idm_step,
+                timesteps=ts_pair,
+                states=state_pair,
+            )
+
+            current_recon = (torch.tanh(recon_next[0, -1]) + 1) / 2
+            recons.append(current_recon)
+
+        print(f"Action-Conditioned Generation Done. Frames: {len(recons)}")
+
+        if len(recons) > 0:
+            recons = torch.stack(recons, dim=0)   # (N, C, H, W)
+        else:
+            recons = torch.empty((0, C, H, W), device=device)
+
+        return recons

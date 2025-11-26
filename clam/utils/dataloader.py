@@ -122,31 +122,21 @@ def process_dataset(
     """
     ds = ds.filter(filter_fn)
 
-    #Hayden
+    #Hayden - data parallelization
     options = tf.data.Options()
     options.experimental_optimization.apply_default_optimizations = True
     options.experimental_optimization.map_parallelization = True
-    # 필요하면 threadpool 사이즈도 조정 가능
-    # options.threading.private_threadpool_size = 16
     ds = ds.with_options(options)
 
-
-    # caching the dataset makes it faster in the next iteration
-    #Hayden
     # if cfg.use_cache:
     #     ds = ds.cache()
 
-    # the buffer size is important for memory usage
-    # and affects the speed
-    # shuffle here is for trajectories
     if shuffle:
         ds = ds.shuffle(100, reshuffle_each_iteration=False)
 
-    # limit the number of trajectories that we use
     ds = ds.take(cfg.num_trajs)
     log(f"\ttaking {cfg.num_trajs} trajectories")
 
-    #Hayden
     if cfg.use_cache:
         print("using cache")
         ds = ds.cache()
@@ -203,13 +193,12 @@ def process_dataset(
         # padding needed when we use shift
         # pad = repeat_padding(pad, cfg.seq_len - 1)
         pad = repeat_padding(pad, 5)
-        #Hayden
+
         #ds = ds.map(partial(pad_dataset, pad=pad))
         ds = ds.map(partial(pad_dataset, pad=pad), num_parallel_calls=tf.data.AUTOTUNE)
 
 
     # quick assert
-
     if cfg.data_type == "n_step":
         assert not cfg.load_latent_actions, (
             "Cannot use n_step with loading latent actions"
@@ -233,12 +222,7 @@ def process_dataset(
         ds = ds.take(cfg.num_examples)
 
         # recommended to do dataset.take(k).cache().repeat()
-        #ds = ds.cache() #Hayden
-
-    #Hayden
-    # if cfg.use_cache:
-    #     print("using cache")
-    #     ds = ds.cache()
+        #ds = ds.cache()
 
     ds = ds.batch(cfg.batch_size, drop_remainder=drop_remainder)
     ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
@@ -264,16 +248,13 @@ def get_dataloader(
 
     env_id = cfg.env.env_id
 
-    # ★ train / eval 상위 폴더 분리
     train_group_name = cfg.env.dataset_name
     # eval_dataset_name이 따로 있으면 그걸 쓰고, 없으면 train과 동일 폴더 사용
     eval_group_name = getattr(cfg.env, "eval_dataset_name", train_group_name)
 
-    # --------------------
-    # 0) TRAIN 원본 데이터셋 로드
-    # --------------------
+    # load train dataset
     datasets = {}
-    dataset_split = dataset_split[: len(dataset_names)]
+    dataset_split = dataset_split[: len(dataset_names)] # since now we use seperate eval dataset, it should be 1.0 
     dataset_ratio = [x / sum(dataset_split) for x in dataset_split]
 
     log(
@@ -333,9 +314,6 @@ def get_dataloader(
     train_ds = {}
     eval_ds = {}
 
-    # --------------------
-    # 1) TRAIN/EVAL split (eval_dataset_names이 없는 기본 케이스)
-    # --------------------
     log("split TRAIN dataset into train and eval (base split): ")
     for i, ds_name in enumerate(dataset_names):
         num_take = int(ds_to_len[ds_name] * cfg.data.train_frac)
@@ -344,9 +322,7 @@ def get_dataloader(
         train_ds[ds_name] = datasets[ds_name].take(num_take)
         eval_ds[ds_name] = datasets[ds_name].skip(num_take)
 
-    # --------------------
-    # 2) Train dataset 전처리
-    # --------------------
+    # pre-processing
     log("creating TRAIN datasets (processed)")
     for i, ds_name in enumerate(dataset_names):
         cfg_train = cfg.data.copy()
@@ -366,11 +342,9 @@ def get_dataloader(
             use_pretrained_embeddings=cfg.model.use_pretrained_embeddings,
         )
 
-    # --------------------
-    # 3) Eval dataset 전처리
-    #    - eval_dataset_names is None  → TRAIN에서 split한 eval_ds 사용
-    #    - eval_dataset_names 존재     → eval_group_name / eval_dataset_names 기준으로 새로 로드
-    # --------------------
+    # Eval dataset pre-processing
+    #    - eval_dataset_names is None  → using eval_ds splited from train dataset
+    #    - eval_dataset_names exist     → load eval datasets
     if eval_dataset_names is None:
         log("creating EVAL datasets (from TRAIN split)")
         cfg_eval = cfg.data.copy()

@@ -112,7 +112,7 @@ class OfflineTrainer(BaseTrainer):
 
             self.log_to_wandb(metrics, prefix="train/")
 
-            #Hayden
+            #Hayden - Temporarily commented out to speed up training
             # #log stats about the model params
             # param_stats = defaultdict(float)
             # for name, param in self.model.named_parameters():
@@ -123,6 +123,7 @@ class OfflineTrainer(BaseTrainer):
 
             # #log a step counter for wandb
             # self.log_to_wandb({"_update": self.train_step}, prefix="step/")
+
 
             # run evaluation for each evaluation environment
             if (not self.cfg.accelerate.use) or self.accelerator.is_main_process: #Hayden
@@ -168,9 +169,10 @@ class OfflineTrainer(BaseTrainer):
 
             for k, v in metrics.items():
                 if isinstance(v, torch.Tensor):
-                    # .item()은 Python float을 리턴하므로 메모리를 거의 안 씁니다.
                     v = v.detach().cpu().item()
                 eval_metrics[k].append(v)
+
+            # to prevent OOM
             del batch
             del batch_np
 

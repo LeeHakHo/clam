@@ -121,15 +121,14 @@ class BaseTrainer:
         log("loading train and eval datasets", "blue")
         # load datasets
 
-        # Hayden
+        # Hayden - using seperated eval dataset
         if cfg.env.eval_datasets != "null":
-            # ⚠️ cfg.env.dataset_name 은 건드리지 말자!
             self.train_ds, self.eval_ds = get_dataloader(
                 cfg,
-                dataset_names=cfg.env.datasets,              # train용
+                dataset_names=cfg.env.datasets,              # train datasets
                 dataset_split=cfg.env.dataset_split,
                 shuffle=cfg.data.shuffle,
-                eval_dataset_names=cfg.env.eval_datasets,    # eval용 이름들
+                eval_dataset_names=cfg.env.eval_datasets,    # eval datasets
             )
         else:
             self.train_ds, self.eval_ds = get_dataloader(
@@ -137,7 +136,6 @@ class BaseTrainer:
                 dataset_names=cfg.env.datasets,
                 dataset_split=cfg.env.dataset_split,
                 shuffle=cfg.data.shuffle,
-                # eval_dataset_names=None 이 디폴트
             )
 
 
@@ -199,7 +197,7 @@ class BaseTrainer:
         log(f"model: {self.model}")
 
         # Initialize Accelerator
-        #Hayden
+        #Hayden - I tried parallel processing to improve the training speed
         if self.cfg.accelerate.use:
             log("Initializing Accelerator", "yellow")
 
@@ -235,7 +233,7 @@ class BaseTrainer:
             # for mixed precision training
             self.scaler = GradScaler()
 
-        #Hayden
+        #Hayden - eval dataset
         tmp_iter = self.eval_dataloader.as_numpy_iterator()
         num_eval_batches = 0
         for _ in tmp_iter:
@@ -345,12 +343,13 @@ class BaseTrainer:
     @property
     def save_dict(self):
 
-        #Hayden
+        #Hayden - Temporarily commented out to speed up training
         # state_dict = {
         #     "model": self.model.state_dict(),
         #     "optimizer": self.optimizer.state_dict(),
         # }
         # return state_dict
+        
         if self.cfg.accelerate.use:
             unwrapped_model = self.accelerator.unwrap_model(self.model)
         else:

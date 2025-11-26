@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-NPZ → TFDS 변환기 (폴더별 개별 저장 / 스트리밍 / 240x240 이미지)
-- root가 상위 폴더(e.g., eval/)면 내부의 모든 데이터셋 폴더를 '각각' 변환하여
-  <tfds-root>/<dataset-name>/<task-name>/<ds_dir.name> 에 저장
-- root가 데이터셋 폴더(frames/ + index_mappings.json)면 그 폴더만 변환하여
-  <tfds-root>/<dataset-name>/<task-name>/<root.name> 에 저장
-- 이미지가 있으면 240x240로 리사이즈하여 'images'로 저장 (uint8)
-- observations/actions 없으면 각각 39D/4D 더미 생성
-- 실패 파일은 경고만 내고 건너뜀
-- OOM 방지: episodes 리스트 누적 없이 제너레이터 → tf.data.Dataset.save 스트리밍 저장
+NPZ → TFDS converter (per-folder saving / streaming / 240x240 images)
+- If root is a parent folder (e.g., eval/), convert every dataset subfolder inside it
+  individually and save to <tfds-root>/<dataset-name>/<task-name>/<ds_dir.name>
+- If root is a dataset folder (frames/ + index_mappings.json), convert only that folder
+  and save to <tfds-root>/<dataset-name>/<task-name>/<root.name>
+- If images exist, resize them to 240x240 and save as 'images' (uint8)
+- If observations/actions are missing, create 39D/4D dummy arrays respectively
+- On failure for a file, only print a warning and skip it
+- To prevent OOM: use a generator without accumulating an episodes list →
+  stream save via tf.data.Dataset.save
 """
 
 import argparse, json, sys
@@ -18,26 +19,56 @@ import cv2
 import tensorflow as tf
 import random
 
-# ----------------- 인자 -----------------
+# ----------------- Args -----------------
 def parse_args():
     p = argparse.ArgumentParser("Convert NPZ → TFDS (per-folder, streaming, 240x240 images)")
-    p.add_argument("--root", required=True, type=Path,
-                   help="(1) frames/와 index_mappings.json이 있는 데이터셋 폴더 또는 "
-                        "(2) 여러 데이터셋 폴더를 포함한 상위 폴더(예: eval/)")
-    p.add_argument("--tfds-root", required=True, type=Path, help="TFDS 루트 디렉터리")
-    p.add_argument("--dataset-name", required=True, type=str, help="TFDS 상위 이름")
-    #p.add_argument("--task-name", required=True, type=str, help="TFDS 중간 이름(서브폴더)")
-    p.add_argument("--task-filter", type=str, default=None, help='특정 태스크만 (예: "Open the door")')
-    p.add_argument("--use-optimal", action="store_true", help="task-filter와 함께 optimal만 선택")
-    p.add_argument("--use-successful", action="store_true", help="성공한 궤적만 선택")
-    p.add_argument("--fraction", type=float, default=0.1,
-                   help="각 데이터셋 폴더에서 사용할 비율 (0<fraction<=1). 예: 0.2 = 20%")
-    p.add_argument("--seed", type=int, default=42, help="샘플링 시드(폴더명과 xor하여 폴더별 고정)")
-    p.add_argument("--no-shuffle", default=True, action="store_true",
-                   help="샘플링 전에 셔플하지 않음(기본은 셔플x)")
+    p.add_argument(
+        "--root",
+        required=True,
+        type=Path,
+        help="(1) A dataset folder that contains frames/ and index_mappings.json, or "
+             "(2) A parent folder that contains multiple dataset folders (e.g., eval/)",
+    )
+    p.add_argument("--tfds-root", required=True, type=Path, help="TFDS root directory")
+    p.add_argument("--dataset-name", required=True, type=str, help="Top-level TFDS dataset name")
+    #p.add_argument("--task-name", required=True, type=str, help="Intermediate TFDS name (subfolder)")
+    p.add_argument(
+        "--task-filter",
+        type=str,
+        default=None,
+        help='Only a specific task (e.g., "Open the door")',
+    )
+    p.add_argument(
+        "--use-optimal",
+        action="store_true",
+        help="With task-filter, select only optimal trajectories",
+    )
+    p.add_argument(
+        "--use-successful",
+        action="store_true",
+        help="Select only successful trajectories",
+    )
+    p.add_argument(
+        "--fraction",
+        type=float,
+        default=0.1,
+        help="Fraction to use from each dataset folder (0 < fraction <= 1). e.g., 0.2 = 20%",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Sampling seed (xored with folder name for per-folder determinism)",
+    )
+    p.add_argument(
+        "--no-shuffle",
+        default=True,
+        action="store_true",
+        help="Do not shuffle before sampling (default: no shuffle)",
+    )
     return p.parse_args()
 
-# ----------------- 유틸 -----------------
+# ----------------- Utils -----------------
 def is_dataset_dir(d: Path) -> bool:
     return (d / "index_mappings.json").exists() and (d / "frames").exists()
 
@@ -48,15 +79,15 @@ def discover_dataset_dirs(root: Path):
     ds = [p for p in root.iterdir() if p.is_dir() and is_dataset_dir(p)]
     if not ds:
         raise FileNotFoundError(
-            f"{root} 아래에서 데이터셋 폴더를 찾지 못했습니다. "
-            f"데이터셋 폴더는 'index_mappings.json'과 'frames/'를 포함해야 합니다."
+            f"Could not find any dataset folders under {root}. "
+            f"A dataset folder must contain both 'index_mappings.json' and 'frames/'."
         )
     return sorted(ds, key=lambda x: x.name.lower())
 
 def build_filelist(root: Path):
     frames_dir = root / "frames"
     files = list(frames_dir.glob("trajectory_*.npz"))
-    # 오타 교정: ' . npz'
+    # Typo correction: ' . npz'
     for weird in frames_dir.glob("trajectory_*. npz"):
         fixed = Path(str(weird).replace(". npz", ".npz").strip())
         try:
@@ -66,7 +97,7 @@ def build_filelist(root: Path):
         files.append(fixed)
     files = sorted(set(files), key=lambda x: x.name.lower())
     if not files:
-        raise FileNotFoundError(f"{frames_dir} 아래에 trajectory_*.npz가 없습니다.")
+        raise FileNotFoundError(f"No trajectory_*.npz files found under {frames_dir}.")
     return files
 
 def choose_indices(root: Path, args):
@@ -75,20 +106,20 @@ def choose_indices(root: Path, args):
         if args.use_optimal:
             pool = meta.get("optimal_by_task", {}).get(args.task_filter, [])
             if not pool:
-                raise ValueError(f'{root.name}에서 "{args.task_filter}"의 optimal 인덱스가 없습니다.')
+                raise ValueError(f'No optimal indices for "{args.task_filter}" in {root.name}.')
             return pool
         pool = meta.get("task_indices", {}).get(args.task_filter, [])
         if not pool:
-            raise ValueError(f'{root.name}에서 "{args.task_filter}"의 task_indices가 없습니다.')
+            raise ValueError(f'No task_indices for "{args.task_filter}" in {root.name}.')
         return pool
     if args.use_successful:
         pool = meta.get("quality_indices", {}).get("successful", [])
         if not pool:
-            raise ValueError(f"{root.name}에 successful 인덱스가 없습니다.")
+            raise ValueError(f"No successful indices in {root.name}.")
         return pool
     pool = meta.get("robot_trajectories", [])
     if not pool:
-        raise ValueError(f"{root.name}의 robot_trajectories가 비어있습니다.")
+        raise ValueError(f"robot_trajectories is empty in {root.name}.")
     return pool
 
 def index_to_path(filelist, i: int) -> Path:
@@ -106,7 +137,7 @@ def _normalize_indices(filelist, idxs):
     dropped = len(idxs0) - len(filtered)
     return filtered, dropped, is_one_based
 
-# ----------------- 핵심: NPZ -> episode dict -----------------
+# ----------------- Core: NPZ -> episode dict -----------------
 def npz_to_episode(p: Path):
     with np.load(p, allow_pickle=False) as d:
         ep = {}
@@ -131,12 +162,16 @@ def npz_to_episode(p: Path):
         if has_obs:
             obs = d["observations"].astype(np.float32)
             ep["observations"] = obs
-            if T == -1: T = obs.shape[0]
-            else: assert obs.shape[0] == T, f"{p}: obs T {obs.shape[0]} != {T}"
+            if T == -1:
+                T = obs.shape[0]
+            else:
+                assert obs.shape[0] == T, f"{p}: obs T {obs.shape[0]} != {T}"
         else:
             STATE_DIM = 39
             if T == -1:
-                raise ValueError(f"{p}: 'frames'와 'observations'가 모두 없어 길이 T를 알 수 없습니다.")
+                raise ValueError(
+                    f"{p}: both 'frames' and 'observations' are missing, cannot determine length T."
+                )
             ep["observations"] = np.zeros((T, STATE_DIM), dtype=np.float32)
 
         assert T > 0, f"{p}: invalid T"
@@ -152,7 +187,7 @@ def npz_to_episode(p: Path):
                 T = m
             ep["actions"] = acts
         else:
-            ep["actions"] = np.zeros((T, 4), dtype=np.float32)  # 4D 더미
+            ep["actions"] = np.zeros((T, 4), dtype=np.float32)  # 4D dummy
 
         # 4) rewards
         if has_rew:
@@ -176,7 +211,7 @@ def npz_to_episode(p: Path):
         })
         return ep
 
-# ----------------- 폴더 하나를 개별 변환/저장 -----------------
+# ----------------- Convert / save a single folder -----------------
 def convert_one_folder(ds_dir: Path, args: argparse.Namespace):
     try:
         filelist = build_filelist(ds_dir)
@@ -188,16 +223,16 @@ def convert_one_folder(ds_dir: Path, args: argparse.Namespace):
 
         n_before = len(idxs)
         if n_before == 0:
-            print(f"[INFO] [{ds_dir.name}] 선택된 인덱스가 없습니다."); 
+            print(f"[INFO] [{ds_dir.name}] no selected indices.")
             return
 
-        # 폴더별 결정적 샘플링
+        # Deterministic sampling per folder
         fold_seed = (hash(ds_dir.name) ^ args.seed) & 0xFFFFFFFF
         rnd = random.Random(fold_seed)
 
         idxs_local = list(idxs)
         if not args.no_shuffle:
-            print("셔플함====================================================================")
+            print("Shuffling ================================================================")
             rnd.shuffle(idxs_local)
 
         take_n = max(1, int(n_before * args.fraction)) if args.fraction < 1.0 else n_before
@@ -209,12 +244,12 @@ def convert_one_folder(ds_dir: Path, args: argparse.Namespace):
             f"{'no-shuffle' if args.no_shuffle else 'shuffled'})"
         )
 
-        # 저장 경로: <tfds-root>/<dataset-name>/<task-name>/<폴더명>
+        # Save path: <tfds-root>/<dataset-name>/<task-name>/<folder-name>
         save_dir = (args.tfds_root / args.dataset_name / ds_dir.name)
         save_dir.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[INFO] 저장 경로: {save_dir}")
+        print(f"[INFO] Save path: {save_dir}")
 
-        # 저장 시그니처
+        # Save signature
         output_signature = {
             "observations": tf.TensorSpec(shape=(None, 39), dtype=tf.float32),
             "actions":      tf.TensorSpec(shape=(None, 4),  dtype=tf.float32),
@@ -234,11 +269,11 @@ def convert_one_folder(ds_dir: Path, args: argparse.Namespace):
                     yield npz_to_episode(p)
                 except Exception as e:
                     skipped += 1
-                    print(f"[WARN] 변환 실패 {ds_dir.name}[idx={i}]: {e}", file=sys.stderr)
+                    print(f"[WARN] Conversion failed for {ds_dir.name}[idx={i}]: {e}", file=sys.stderr)
             print(f"[STATS] [{ds_dir.name}] used={len(idxs_sub)}, skipped={skipped}")
 
         ds = tf.data.Dataset.from_generator(gen_one_folder, output_signature=output_signature)
-        # TF 최신 API
+        # Latest TF API
         if hasattr(tf.data.Dataset, "save"):
             ds.save(str(save_dir))
         else:
@@ -246,13 +281,16 @@ def convert_one_folder(ds_dir: Path, args: argparse.Namespace):
         print(f"[DONE] [{ds_dir.name}] TFDS saved to: {save_dir}")
 
     except Exception as e:
-        print(f"[WARN] 폴더 스킵 {ds_dir}: {e}", file=sys.stderr)
+        print(f"[WARN] Skipping folder {ds_dir}: {e}", file=sys.stderr)
 
-# ----------------- 메인 -----------------
+# ----------------- Main -----------------
 def main():
     args = parse_args()
     all_ds_dirs = discover_dataset_dirs(args.root)
-    print(f"[INFO] 변환 대상 데이터셋 폴더: {len(all_ds_dirs)}개 @ {args.root.resolve()}")
+    print(
+        f"[INFO] Number of dataset folders to convert: {len(all_ds_dirs)} "
+        f"@ {args.root.resolve()}"
+    )
 
     for ds_dir in all_ds_dirs:
         convert_one_folder(ds_dir, args)
