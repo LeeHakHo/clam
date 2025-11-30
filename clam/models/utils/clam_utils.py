@@ -3,6 +3,8 @@ from clam.models.clam.diffusion_clam import DiffusionCLAM
 from clam.models.clam.space_time_clam import SpaceTimeCLAM
 from clam.models.clam.transformer_clam import TransformerCLAM, TransformerIDM
 
+from clam.models.clam.space_time_clam_NSVQ import SpaceTimeCLAM_NSVQ #Hayden
+
 #Hayden
 #from clam.models.hierarchical_clam.v1 import HierarchicalCLAMv1
 #from clam.models.hierarchical_clam.v2 import HierarchicalCLAMv2
@@ -34,6 +36,8 @@ def get_clam_cls(name):
         return HierarchicalCLAMv2
     elif name == "diffusion_clam":
         return DiffusionCLAM
+    elif name == "nsvq_clam":
+        return SpaceTimeCLAM_NSVQ
     else:
         raise ValueError(f"Unknown CLAM model {name}")
 

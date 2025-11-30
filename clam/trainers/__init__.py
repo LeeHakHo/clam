@@ -22,4 +22,5 @@ trainer_to_cls = {
     "dynamo": DynaMoTrainer,
     "vpt": VPTTrainer,
     "vpt_bc": VPTBCTrainer,
+    "nsvq_clam": CLAMTrainer, #Hayden
 }

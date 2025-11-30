@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-task=a100:1
 #SBATCH --mem=184G
-#SBATCH --time=08:00:00
+#SBATCH --time=10:00:00
 #!/bin/bash 
 
 #conda create -n clam python=3.11
@@ -14,6 +14,7 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate clam
 cd clam
+export WANDB_API_KEY="61a1a21df93bbb2da31d41abc3400294b59ba6eb"
 
 echo "oxe_0.1_128 cahce o 128*128 batch 4 multi-gpu x/ NSVQ test"
 export PYTHONPATH=$PWD:$PYTHONPATH
@@ -82,7 +83,7 @@ nvidia-smi
 #     model.idm.quantize_la=True
 
 #Train Language table --------------
-python3 main.py --config-name=train_st_clam \
+python3 main.py --config-name=train_nsvq_clam \
     env=metaworld \
     env.dataset_name=language_table_full/samples\
     env.datasets='[chunk-001]' \

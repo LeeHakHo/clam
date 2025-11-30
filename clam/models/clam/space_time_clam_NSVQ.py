@@ -288,7 +288,7 @@ class SpaceTimeFDM(BaseModel):
         return video_recon
 
 
-class SpaceTimeCLAM(BaseModel):
+class SpaceTimeCLAM_NSVQ(BaseModel):
     """
     ST-CLAM with NSVQ (LAPA-style) latent actions.
     TransformerCLAM 에 상속/의존 안 하고, BaseModel에서 바로 시작해서
