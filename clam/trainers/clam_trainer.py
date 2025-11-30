@@ -79,7 +79,9 @@ class CLAMTrainer(OfflineTrainer):
             )
 
         # dataset for video
-        self.video_ds_name = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
+        #self.video_ds_name = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
+        #self.video_ds_name = "metaworld_eval"
+        self.video_ds_name = "chunk-000"
         cfg2 = copy.deepcopy(self.cfg)
         cfg2.data.shuffle = False
         cfg2.data.batch_size = 1
@@ -358,6 +360,18 @@ class CLAMTrainer(OfflineTrainer):
                 total_loss += clam_output.idm_output.vq_loss
 
             metrics.update(clam_output.idm_output.vq_metrics)
+
+        #Dead Code Revival
+        if train and self.train_step > 0 and self.train_step % 500 == 0:
+                # 모델 구조상 vq 모듈에 접근 가능한지 확인
+                if hasattr(self.model.idm, "vq") and self.model.idm.vq is not None:
+                    # SimpleNSVQ에 구현한 메서드가 있는지 확인 후 호출
+                    if hasattr(self.model.idm.vq, "replace_unused_codebooks"):
+                        # 로그를 찍어 실제로 동작하는지 확인
+                        log(f"[Trainer] Running Dead Code Revival at step {self.train_step}", "yellow")
+                        # num_batches는 리셋 주기와 맞춰주는 것이 좋음
+                        self.model.idm.vq.replace_unused_codebooks(num_batches=500)
+
 
         # run this if we are doing joint training or if this is eval
         if (
@@ -644,6 +658,146 @@ class CLAMTrainer(OfflineTrainer):
         grid = (grid * 255).byte().cpu().numpy()
         return grid
 
+    @torch.no_grad()
+    def make_correlation_vq(
+        self,
+        ds_name: str,
+        save_path: str = "results/vis/figure13_vq.png",
+        max_batches: int = 200,
+        max_points: int = 50000,
+        wandb_prefix: str = "figures/",
+    ):
+        """
+        이미지 기반 CLAM + VQ가 이미 학습되어 있다는 가정 하에,
+        (action_x, action_y) 평면 위에 VQ code index를 색깔로 뿌려주는
+        Figure 13 스타일 플롯을 만들고, wandb에도 로그한다.
+
+        - ds_name: self.eval_ds 또는 self.train_ds에 들어 있는 키 이름
+        - save_path: 저장할 png 경로
+        """
+
+        self.model.eval()
+
+        # 1) 어떤 dataset 쓸지 고르기 (eval 우선, 없으면 train에서 찾기)
+        if hasattr(self, "eval_ds") and ds_name in self.eval_ds:
+            ds = self.eval_ds[ds_name]
+        elif hasattr(self, "train_ds") and ds_name in self.train_ds:
+            ds = self.train_ds[ds_name]
+        else:
+            raise ValueError(f"Unknown dataset name: {ds_name}")
+
+        it = ds.as_numpy_iterator()
+
+        all_actions_xy = []
+        all_codes = []
+        num_points = 0
+
+        for b_idx, batch_np in enumerate(it):
+            if b_idx >= max_batches:
+                break
+
+            batch = to_device(batch_np, self.device)
+            batch = Batch(**batch)
+
+            # 2) 모델 forward → CLAMOutput
+            out = self.model(
+                batch.observations,
+                timesteps=batch.timestep,
+                states=batch.states,
+            )
+
+            idm_out = out.idm_output
+
+            # VQ 안 쓰는 모델이면 스킵
+            if (
+                idm_out is None
+                or idm_out.vq_outputs is None
+                or "indices" not in idm_out.vq_outputs
+            ):
+                continue
+
+            # indices: (B, T) 가정
+            codes = idm_out.vq_outputs["indices"]  # tensor
+            # action alignment: la[:,1:] ↔ actions[:, :-1]
+            codes = codes[:, 1:]                   # (B, T-1)
+
+            actions = batch.actions[:, :-1, :2]    # (B, T-1, 2)  only x,y
+
+            # CPU + numpy로 변환
+            codes_np = codes.detach().cpu().numpy().reshape(-1)
+            acts_np = actions.detach().cpu().numpy().reshape(-1, 2)
+
+            all_actions_xy.append(acts_np)
+            all_codes.append(codes_np)
+
+            num_points += acts_np.shape[0]
+            if num_points >= max_points * 2:
+                break
+
+        if len(all_actions_xy) == 0:
+            log("[make_correlation_vq] No samples collected.", "red")
+            return
+
+        actions_xy = np.concatenate(all_actions_xy, axis=0)  # (N, 2)
+        codes = np.concatenate(all_codes, axis=0)            # (N,)
+
+        # 전체가 너무 많으면 서브샘플링
+        N = actions_xy.shape[0]
+        if N > max_points:
+            idx = np.random.choice(N, max_points, replace=False)
+            actions_xy = actions_xy[idx]
+            codes = codes[idx]
+            N = max_points
+
+        log(f"[make_correlation_vq] plotting {N} points", "green")
+
+        # VQ vocab size 가져오기 (config → 모델 순으로 시도)
+        vocab_size = None
+        try:
+            vocab_size = int(self.cfg.model.idm.vq.kwargs.codebook_size)
+        except Exception:
+            if hasattr(self.model, "idm") and hasattr(self.model.idm, "vq"):
+                if hasattr(self.model.idm.vq, "codebook_size"):
+                    vocab_size = int(self.model.idm.vq.codebook_size)
+
+        plt.figure(figsize=(8, 8))
+        sc = plt.scatter(
+            actions_xy[:, 0],
+            actions_xy[:, 1],
+            c=codes,
+            s=4,
+            alpha=0.6,
+            cmap="tab20",
+        )
+        plt.colorbar(sc, label="Latent Code Index")
+
+        title = f"Latent Action Correlation (Dataset: {ds_name})"
+        if vocab_size is not None:
+            title += f"\nVocab Size: {vocab_size}"
+        plt.title(title)
+
+        plt.xlabel("action x")
+        plt.ylabel("action y")
+        plt.tight_layout()
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+
+        log(f"[make_correlation_vq] saved figure to {save_path}", "green")
+
+        # wandb에 이미지 로그
+        if hasattr(self, "log_to_wandb"):
+            self.log_to_wandb(
+                {f"{wandb_prefix}figure13_{ds_name}": wandb.Image(save_path)}
+            )
+            log(
+                f"[make_correlation_vq] logged to wandb as {wandb_prefix}figure13_{ds_name}",
+                "green",
+            )
+
+        return save_path
+
 
     def eval(self, step: int):
         super().eval(step=step)
@@ -722,7 +876,9 @@ class CLAMTrainer(OfflineTrainer):
             #                 prefix="images/")
 
             # example video reconstrucion
-            video_target = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
+            #video_target = "jesbu1_oxe_rfm_eval_oxe_viola_eval"
+            #video_target = "metaworld_eval"
+            video_target = "chunk-000"
             path = self.make_episode_video( # or use self.make_episode_video_step
                 ds_name= video_target,
                 save_path="results/vis/oxe_eval_ep0.mp4",
@@ -730,3 +886,11 @@ class CLAMTrainer(OfflineTrainer):
                 max_steps=50,
             )
             log(f"visualizing video = {path}", "blue")
+
+            # Figure 13 (action 2D + VQ codes)
+            self.make_correlation_vq(
+                ds_name=video_target,  # 같은 eval dataset 사용
+                save_path="results/vis/figure13_vq.png",
+                max_batches=200,
+                max_points=50000,
+            )

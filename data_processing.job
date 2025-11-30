@@ -5,9 +5,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=248G
-#SBATCH --time=12:00:00
+#SBATCH --time=04:00:00
 #!/bin/bash 
-
 
 #conda create -n clam python=3.11
 
@@ -18,8 +17,23 @@ cd clam
 nvidia-smi
 
 
-python3 scripts/file_processing_v4.py \
-    --root /project2/biyik_1165/hyeonhoo/oxe/eval\
-    --tfds-root /project2/biyik_1165/hyeonhoo/tensorflow_datasets/oxe\
-    --dataset-name oxe_eval_0.1_128\
-    --fraction 0.1
+# python3 scripts/file_processing_v4.py \
+#     --root /project2/biyik_1165/hyeonhoo/oxe/eval\
+#     --tfds-root /project2/biyik_1165/hyeonhoo/tensorflow_datasets/oxe\
+#     --dataset-name oxe_eval_0.1_128\
+#     --fraction 0.1
+
+python3 scripts/language_table_to_tfds.py \
+  --root /project2/biyik_1165/hyeonhoo/language_table_001 \
+  --chunk-id chunk-001 \
+  --tfds-root /project2/biyik_1165/hyeonhoo/tensorflow_datasets \
+  --dataset-name language_table_full \
+  --fraction 1.0 \
+  --image-size 128
+
+# conda deactivate
+
+# hf download IPEC-COMMUNITY/language_table_lerobot \
+#   --repo-type dataset \
+#   --include "data/chunk-001/**" \
+#   --local-dir /project2/biyik_1165/hyeonhoo/language_table_001 

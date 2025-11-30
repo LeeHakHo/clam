@@ -1,0 +1,29 @@
+# conf/model/idm/vq/vqNSVQ.yaml 같은 위치라고 가정
+
+name: vqNSVQ
+
+# hp_name은 기존 코드에서 codebook_size, discarding_threshold 로 로깅하니까 유지
+hp_name: ${.name}_cb-${.kwargs.codebook_size}-th-${.kwargs.discarding_threshold}
+
+kwargs:
+  # --- 기존 CLAM 쪽에서 기대하는 이름 (SpaceTimeIDM에서 num_embeddings로 매핑해줌) ---
+  codebook_size: 8          # => NSVQ.num_embeddings 로 변환됨
+
+  # --- NSVQ 고유 하이퍼파라미터 ---
+  embedding_dim: 256        # NSVQ 내부 codebook / CNN 채널 차원
+                            # (보통 idm.net.dim_model 과 같게 두는게 안전)
+
+  discarding_threshold: 0.01
+  initialization: "normal"  # ["normal", "uniform"] 중 하나
+
+  # NSVQ에서 CNN encoder 깊이 선택용 (1, 2, 4, 16, 64, 256 중 하나)
+  # 128x128, patch_size=32 -> 4x4 패치라서 16 정도가 무난
+  code_seq_len: 256 #16 -> 256
+
+  # 이미지 / 패치 설정 (SpaceTimeIDM 에서 다시 덮어쓰는데, 여기선 기본값 역할)
+  patch_size: 32
+  image_size: 128
+
+defaults:
+  - base
+  - _self_

@@ -17,6 +17,8 @@ from clam.models.utils.utils import (
     make_upconv_net,
 )
 from clam.utils.logger import log
+from clam.models.simple_nsvq import SimpleNSVQ #Hayden
+from clam.models.vqNSVQ import NSVQ #Hayden
 
 
 def get_vq_cls(cls_name):
@@ -28,6 +30,10 @@ def get_vq_cls(cls_name):
         return ResidualVQ
     elif cls_name == "ema":
         return VectorQuantize
+    elif cls_name == "simple_nsvq": #Hayden
+        return SimpleNSVQ
+    elif cls_name == "vqNSVQ": #Hayden
+        return NSVQ
     else:
         raise ValueError(f"vq_cls: {cls_name} not supported")
 
