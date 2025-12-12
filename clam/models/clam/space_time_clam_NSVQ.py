@@ -15,9 +15,7 @@ from clam.models.utils.utils import CLAMOutput, IDMOutput, compute_perplexity
 from clam.utils.logger import log
 
 # 사용자님이 정의하신 NSVQ 클래스 import
-# (같은 파일에 있다면 import 불필요, 다른 파일이라면 경로 맞춰주세요)
 from clam.models.vqNSVQ import NSVQ 
-
 
 def extract_state_info(states: torch.Tensor):
     pos_goal = states[:, :, -3:]
@@ -56,6 +54,8 @@ class SpaceTimeIDM(BaseModel):
             self.cfg.net.pos_enc, embedding_dim=self.model_dim, max_len=200
         )
 
+        #Hayden - LayerNorm added to prevent codebook collapse
+        self.ln_pre_head = nn.LayerNorm(self.model_dim)
         self.la_head = nn.Linear(self.model_dim, self.la_dim)
 
         # ----------------- VQ Init -----------------
@@ -63,27 +63,36 @@ class SpaceTimeIDM(BaseModel):
         if self.cfg.quantize_la:
             log(f"Initializing NSVQ for LAPA", "green")
             vq_kwargs = dict(self.cfg.vq.kwargs)
-            
+
             if "codebook_size" in vq_kwargs:
                 vq_kwargs["num_embeddings"] = vq_kwargs.pop("codebook_size")
-            
             if "eps" in vq_kwargs:
                 vq_kwargs.pop("eps")
+
+            # la_dim 기준으로 양자화
+            vq_kwargs["dim"] = self.la_dim        
+            vq_kwargs["embedding_dim"] = self.la_dim 
+            # Vector Input 모드이므로 image_size, patch_size는 무시되지만 형식상 남겨둠
+            vq_kwargs["image_size"] = 1
+            vq_kwargs["patch_size"] = 1
             
-            # 1x1 Trick
-            fake_size = 32
-            vq_kwargs["image_size"] = fake_size
-            vq_kwargs["patch_size"] = fake_size
-            
-            vq_kwargs["dim"] = self.model_dim
-            vq_kwargs["embedding_dim"] = self.cfg.la_dim
-            
-            # [Safe Init]
-            vq_kwargs["device"] = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-            
-            self.vq = NSVQ(**vq_kwargs) # 또는 NSVQ
+            # [Fixed 1] NSVQ가 벡터 입력을 처리하도록 플래그 설정
+            vq_kwargs["is_vector_input"] = True 
+
+
+            #Hayden
+            # [Fixed] Set threshold explicitly to prevent aggressive pruning
+            if "discarding_threshold" not in vq_kwargs:
+                vq_kwargs["discarding_threshold"] = 0.01
+
+            vq_kwargs["device"] = (
+                torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            )
+
+            self.vq = NSVQ(**vq_kwargs)
         else:
             log("Not using vq, continuous latent action space", "red")
+
 
     def forward(
         self, observations, timesteps: torch.Tensor, states: torch.Tensor, **kwargs
@@ -94,14 +103,9 @@ class SpaceTimeIDM(BaseModel):
         patches = patchify(observations, self.cfg.patch_size)
         patches_embed = self.input_embed(patches)
         patches_embed = self.activation(patches_embed)
-
-        if self.cfg.add_action_token:
-            action_pad = self.action_in.expand(B, T, 1, self.model_dim)
-            patches_embed = torch.cat([action_pad, patches_embed], dim=2)
-            N_aug = self.num_patches + 1
-        else:
-            N_aug = self.num_patches
-
+        
+        N_aug = self.num_patches 
+        # (Positional Embedding 관련 코드는 기존 유지)
         if self.cfg.net.pos_enc == "learned":
             t_pos_embed = self.temporal_pos_embed(timesteps.long())
             t_pos_embed = einops.repeat(t_pos_embed, "B T E -> B T N E", N=N_aug)
@@ -124,66 +128,63 @@ class SpaceTimeIDM(BaseModel):
                 torch.cat([patches_embed, hand_pos_gripper_embed], dim=-1)
             )
 
+        # Encoder 통과
         z = self.encoder(patches_embed, pos_embed=pos_embed, causal=False)
         z = z.view(B, T, -1, self.model_dim)
 
-        if self.cfg.add_action_token:
-            la_z = z[:, :, 0]
-        else:
-            la_z = z.mean(dim=2)
+        # Latent Extraction
+        la_z = z.mean(dim=2) # [B, T, model_dim]
 
-        la_continuous = self.la_head(la_z)
 
-        # ----------------- NSVQ Forward -----------------
+        #Hayden #Apply LayerNorm before head
+        la_z = self.ln_pre_head(la_z)
+
+        la_continuous = self.la_head(la_z) # [B, T, la_dim]
+
+        # ----------------- VQ Logic Start -----------------
         vq_loss = torch.tensor(0.0, device=observations.device)
-        quantized_la = None
-        indices = None
-        vq_outputs = {}
-        vq_metrics = {}
+        vq_outputs, vq_metrics = {}, {}
+        
+        pad_la = torch.zeros(B, 1, self.la_dim, device=observations.device)
+        # 기본값: Continuous Delta (VQ 안 쓸 때 대비)
+        la_final = torch.cat([pad_la, la_continuous[:, 1:] - la_continuous[:, :-1]], dim=1) if T > 1 else la_continuous
 
-        if self.cfg.quantize_la and self.vq is not None:
-            # [CRITICAL FIX]: Reshape to (N, 1, Dim) for NSVQ encode (permute expects 3 dims)
-            first = la_z[:, :-1].reshape(-1, 1, self.model_dim)
-            last  = la_z[:, 1:].reshape(-1, 1, self.model_dim)
+        if self.cfg.quantize_la and self.vq is not None and T > 1:
+            
+            # Prepare Inputs for NSVQ (Flattened)
+            e_current = la_continuous[:, :-1] # t   : [B, T-1, la_dim]
+            e_next    = la_continuous[:, 1:]  # t+1 : [B, T-1, la_dim]
+            
+            flat_current = e_current.reshape(-1, self.la_dim)
+            flat_last    = e_next.reshape(-1, self.la_dim)
 
-            q_la, perplexity, _, idx_flat = self.vq(
-                input_data_first=first,
-                input_data_last=last,
-                codebook_training_only=False
+            # NSVQ Forward (Two Inputs -> Internal Difference)
+            quantized_flat, perplexity, _, idx_flat = self.vq(
+                input_data_first=flat_current, 
+                input_data_last=flat_last,
+                codebook_training_only=False #True -> False
             )
             
-            # --- Output Handling ---
-            # idx_flat: [N, 1] or [N] -> flatten first
-            idx_flat = idx_flat.reshape(-1) 
-            
-            idx_reshaped = idx_flat.view(B, T-1) 
-            
-            # q_la: [N, 1, Dim] -> [B, T-1, Dim]
-            q_la_reshaped = q_la.view(B, T-1, -1)
+            quantized_delta = quantized_flat.view(B, T-1, self.la_dim)
+            indices = idx_flat.view(B, T-1)
 
-            # Padding (T-1 -> T)
-            padding_val = torch.zeros(B, 1, q_la_reshaped.shape[-1], device=q_la_reshaped.device)
-            la_final = torch.cat([padding_val, q_la_reshaped], dim=1) 
+            # Final Output Construction
+            la_final = torch.cat([pad_la, quantized_delta], dim=1) 
             
-            padding_idx = torch.zeros(B, 1, dtype=idx_reshaped.dtype, device=q_la_reshaped.device)
-            indices = torch.cat([padding_idx, idx_reshaped], dim=1)
-
-            vq_outputs = {"indices": indices}
+            pad_idx = torch.zeros(B, 1, dtype=torch.long, device=observations.device)
+            vq_outputs = {"indices": torch.cat([pad_idx, indices], dim=1)}
             vq_metrics = {"perplexity": perplexity.item()}
-            
-            return IDMOutput(
-                la=la_final,          
-                quantized_la=la_final, 
-                vq_loss=vq_loss,
-                vq_metrics=vq_metrics,
-                vq_outputs=vq_outputs,
-                encoder_out=patches,
-            )
-            
-        return IDMOutput(la=la_continuous, encoder_out=patches)
+
+        return IDMOutput(
+            la=la_final,
+            quantized_la=la_final,
+            vq_loss=vq_loss,
+            vq_metrics=vq_metrics,
+            vq_outputs=vq_outputs,
+            encoder_out=patches, # FDM으로 원본 패치 전달
+        )
 
 class SpaceTimeFDM(BaseModel):
-    # [수정] use_vq 인자 추가
     def __init__(self, cfg: DictConfig, input_dim: int, la_dim: int, use_vq: bool = False):
         super().__init__(cfg, input_dim)
         self.name = "SpaceTimeFDM"
@@ -195,9 +196,7 @@ class SpaceTimeFDM(BaseModel):
         self.decoder = STTransformer(cfg=self.cfg.net)
         self.patch_embed = nn.Linear(self.patch_token_dim, self.model_dim)
         
-        # [수정] NSVQ를 쓴다면 입력 차원은 model_dim (NSVQ가 project_out을 하므로)
-        input_la_dim = self.model_dim if use_vq else la_dim
-        self.la_embed = nn.Linear(input_la_dim, self.model_dim)
+        self.la_embed = nn.Linear(la_dim, self.model_dim)
 
         self.spatial_pos_embed = get_pos_encoding(
             self.cfg.net.pos_enc, embedding_dim=self.model_dim, max_len=200
@@ -225,16 +224,25 @@ class SpaceTimeFDM(BaseModel):
         
         B, T, C, H, W = observations.shape
 
-        # IDMOutput에서 VQ를 거친 Latent 사용 (T=0 패딩 제외)
+        # Latent Action (Delta)
         la = idm_output.la[:, 1:] # [B, T-1, Dim]
-        patches = idm_output.encoder_out
+        
+        # Previous Frame Patches (Encoder Output)
+        patches = idm_output.encoder_out[:, :-1] # [B, T-1, N, Dim]
+        
+        # [Fixed 2] Stop Gradient (sg) 적용! 
+        # LAPA 논문: "apply stop gradient to the patch embedding... to avoid representation collapse"
+        patches = patches.detach()
 
         la_embed = self.la_embed(la)
         la_embed = einops.rearrange(la_embed, "B T E -> B T 1 E")
 
-        patches_embed = self.patch_embed(patches[:, :-1])
+        patches_embed = self.patch_embed(patches)
+        
+        # [Fixed 3] Conditioning
+        # 논문은 Cross-Attn을 권장하지만, 기존 STTransformer가 Additive만 지원한다면 아래 유지.
+        # Stop Gradient가 적용되었으므로 Additive여도 Collapse는 방지됨.
         video_action_patches = la_embed + patches_embed
-        #video_action_patches = patches_embed
 
         if self.cfg.concatenate_gripper_state:
             hand_pos_gripper = extract_state_info(states[:, :-1])
@@ -287,48 +295,30 @@ class SpaceTimeFDM(BaseModel):
         video_recon = einops.rearrange(video_recon, "B T H W C -> B T C H W")
         return video_recon
 
-
-class SpaceTimeCLAM_NSVQ(BaseModel):
-    """
-    ST-CLAM with NSVQ (LAPA-style) latent actions.
-    TransformerCLAM 에 상속/의존 안 하고, BaseModel에서 바로 시작해서
-    IDM -> FDM forward 를 직접 정의하는 버전.
-    """
+class SpaceTimeCLAM_NSVQ(TransformerCLAM):
 
     def __init__(self, cfg: DictConfig, input_dim: int, la_dim: int):
-        BaseModel.__init__(self, cfg=cfg, input_dim=input_dim)
-
+        super(BaseModel, self).__init__()
         self.cfg = cfg
-        self.name = "ST-ViVit"
+        self.name = "ST-CLAM_NSVQ"
         self.la_dim = la_dim
-
-        # 우리가 정의한 SpaceTimeIDM / SpaceTimeFDM 사용
         self.idm = SpaceTimeIDM(cfg.idm, input_dim=input_dim, la_dim=la_dim)
-
-        # NSVQ를 쓰면 FDM 쪽 latent 차원이 model_dim 기준이 되므로 use_vq 플래그 전달
-        use_vq = cfg.idm.quantize_la if hasattr(cfg, "idm") else False
-        self.fdm = SpaceTimeFDM(cfg.fdm, input_dim=input_dim, la_dim=la_dim, use_vq=use_vq)
+        self.fdm = SpaceTimeFDM(cfg.fdm, input_dim=input_dim, la_dim=la_dim)
 
     def forward(
         self,
-        observations: torch.Tensor,   # [B, T, C, H, W]
-        timesteps: torch.Tensor,      # [B, T]
-        states: torch.Tensor = None,  # [B, T, D] or None
+        observations: torch.Tensor,
+        timesteps: torch.Tensor,
+        states: torch.Tensor = None,
         **kwargs,
     ) -> CLAMOutput:
-        """
-        원래 TransformerCLAM.forward 가 하던 걸
-        SpaceTimeIDM/FDM 기반으로 직접 구현한 버전.
-        """
-
-        # 1) IDM: latent action (la) + encoder_out (patches) 생성
+        
         idm_output = self.idm(
             observations=observations,
             timesteps=timesteps,
             states=states,
         )
 
-        # 2) FDM: la + patches 로 다음 프레임 재구성
         recon = self.fdm(
             observations=observations,
             idm_output=idm_output,
@@ -336,11 +326,6 @@ class SpaceTimeCLAM_NSVQ(BaseModel):
             states=states,
         )
 
-        # 3) CLAMOutput 으로 래핑
-        #    trainer 쪽에서 쓰는 필드는:
-        #      - reconstructed_obs
-        #      - la
-        #      - idm_output (안에 vq_loss, vq_metrics, vq_outputs 등)
         return CLAMOutput(
             la=idm_output.la,
             reconstructed_obs=recon,
@@ -350,14 +335,10 @@ class SpaceTimeCLAM_NSVQ(BaseModel):
     @torch.no_grad()
     def rollout_idm_fdm_closed_loop(
         self,
-        gt_seq: torch.Tensor,    # (T, C, H, W)
-        gt_states: torch.Tensor, # (T, D) or None
+        gt_seq: torch.Tensor,    
+        gt_states: torch.Tensor, 
         max_steps: int | None = None,
     ):
-        """
-        네가 이미 만들어둔 rollout 함수 그대로 써도 되고,
-        아래처럼 SpaceTimeIDM/FDM 기반으로만 돌아가면 됨.
-        """
         use_gt_image = True
         use_gt_action = True
         use_zero_action = False
@@ -373,12 +354,12 @@ class SpaceTimeCLAM_NSVQ(BaseModel):
         recons = []
 
         def sample_la(idm_out):
-            return idm_out.la  # NSVQ가 적용된 la
+            return idm_out.la 
 
-        # step 1: GT 2프레임으로 워밍업
+        # step 1: Warmup
         if max_steps >= 1:
-            pair0 = gt_seq[0:2].unsqueeze(0)  # (1,2,C,H,W)
-            ts0   = torch.tensor([[0, 1]], device=device)  # (1,2)
+            pair0 = gt_seq[0:2].unsqueeze(0)  
+            ts0   = torch.tensor([[0, 1]], device=device)  
             state0 = None if gt_states is None else gt_states[0:2].unsqueeze(0)
 
             idm_out0 = self.idm(pair0, timesteps=ts0, states=state0)
@@ -390,7 +371,7 @@ class SpaceTimeCLAM_NSVQ(BaseModel):
             recon0 = self.fdm(pair0, idm_step0, ts0, state0)
             recons.append((torch.tanh(recon0[0, -1]) + 1) / 2)
 
-        # step 2..max_steps: closed-loop rollout
+        # step 2..max_steps: Closed-loop
         for step in range(2, max_steps + 1):
             t_prev, t_curr = step - 1, step
             ts_pair = torch.tensor([[t_prev, t_curr]], device=device)
@@ -407,7 +388,6 @@ class SpaceTimeCLAM_NSVQ(BaseModel):
                 prev_img, curr_img = recons[-2], recons[-1]
 
             pair_gen = torch.stack([prev_img, curr_img], dim=0).unsqueeze(0)
-
             pair_for_idm = pair_gt if use_gt_image else pair_gen
 
             idm_out = self.idm(pair_for_idm, timesteps=ts_pair, states=state_pair)

@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --account=biyik_1165
-#SBATCH --partition=main
+#SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=248G
-#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-task=v100:1
+#SBATCH --mem=184G
+#SBATCH --time=1:00:00
 #!/bin/bash 
 
 #conda create -n clam python=3.11
@@ -24,16 +25,28 @@ nvidia-smi
 #     --fraction 0.1
 
 python3 scripts/language_table_to_tfds.py \
-  --root /project2/biyik_1165/hyeonhoo/language_table_001 \
-  --chunk-id chunk-001 \
+  --root /project2/biyik_1165/hyeonhoo/language_table_30 \
   --tfds-root /project2/biyik_1165/hyeonhoo/tensorflow_datasets \
-  --dataset-name language_table_full \
+  --dataset-name language_table_30 \
   --fraction 1.0 \
   --image-size 128
 
-# conda deactivate
 
-# hf download IPEC-COMMUNITY/language_table_lerobot \
-#   --repo-type dataset \
-#   --include "data/chunk-001/**" \
-#   --local-dir /project2/biyik_1165/hyeonhoo/language_table_001 
+
+
+#=====download======
+# export HF_HUB_ETAG_TIMEOUT=120
+# export HF_HUB_DOWNLOAD_TIMEOUT=1200
+# export HF_HUB_MAX_RETRIES=10
+
+# python - << 'EOF'
+# from huggingface_hub import snapshot_download
+
+# snapshot_download(
+#     repo_id="IPEC-COMMUNITY/language_table_lerobot",
+#     repo_type="dataset",
+#     local_dir="/project2/biyik_1165/hyeonhoo/language_table_30",
+#     local_dir_use_symlinks=False,      # <<< 여기서 symlink 완전 OFF
+#     allow_patterns=["videos/chunk-0[0-2][0-9]/*"],  # 000~029만
+# )
+# EOF

@@ -21,8 +21,9 @@ import matplotlib.pyplot as plt
 import imageio
 import os
 from matplotlib import colormaps as mpl_cmaps
+from matplotlib import colors as mcolors
 #import matplotlib.cm as cm
-
+import colorsys
 
 def get_labelled_dataloader(cfg):
     if cfg.data.labelled_data_type == "trajectory":
@@ -357,22 +358,20 @@ class CLAMTrainer(OfflineTrainer):
 
         if self.cfg.model.idm.quantize_la:
             if clam_output.idm_output.vq_loss is not None:
-                total_loss += clam_output.idm_output.vq_loss
+                total_loss += 1.0 * clam_output.idm_output.vq_loss #일단 weight 0.1 #Hayden
 
             metrics.update(clam_output.idm_output.vq_metrics)
 
-        #Dead Code Revival
-        if train and self.train_step > 0 and self.train_step % 500 == 0:
-                # 모델 구조상 vq 모듈에 접근 가능한지 확인
+        # [Fixed] Frequency of Dead Code Revival increased (500 -> 50 for early stage)
+        if train and self.train_step > 0:
+            revival_freq = 50 if self.train_step < 2000 else 500 #초기에 50
+            
+            if self.train_step % revival_freq == 0:
                 if hasattr(self.model.idm, "vq") and self.model.idm.vq is not None:
-                    # SimpleNSVQ에 구현한 메서드가 있는지 확인 후 호출
                     if hasattr(self.model.idm.vq, "replace_unused_codebooks"):
-                        # 로그를 찍어 실제로 동작하는지 확인
                         log(f"[Trainer] Running Dead Code Revival at step {self.train_step}", "yellow")
-                        # num_batches는 리셋 주기와 맞춰주는 것이 좋음
-                        self.model.idm.vq.replace_unused_codebooks(num_batches=500)
-
-
+                        self.model.idm.vq.replace_unused_codebooks(num_batches=revival_freq)
+                    
         # run this if we are doing joint training or if this is eval
         if (
             self.cfg.joint_action_decoder_training
@@ -430,7 +429,7 @@ class CLAMTrainer(OfflineTrainer):
             
             for i in range(obs_chunk.shape[0]):
                 full_gt_seq.append(torch.tensor(obs_chunk[i]))
-                full_gt_states.append(torch.tensor(statㄴe_chunk[i]))
+                full_gt_states.append(torch.tensor(state_chunk[i]))
                 
         except StopIteration:
             return None
@@ -557,10 +556,16 @@ class CLAMTrainer(OfflineTrainer):
 
             Tprime = pred.shape[0]
             for t in range(Tprime):
-                diff_t = (diff_all[t] / vmax).clamp(0, 1)
-                idx    = (diff_t.squeeze(0) * 255).round().long()
-                diff_rgb = self._cmap_lut[idx].permute(2,0,1).contiguous()  # (3,H,W)
+                diff_t = diff_all[t] / vmax
 
+                # NaN / Inf 처리
+                diff_t = torch.nan_to_num(diff_t, nan=0.0, posinf=1.0, neginf=0.0)
+                diff_t = diff_t.clamp(0, 1)
+
+                idx = (diff_t.squeeze(0) * 255).floor().clamp(0, 255).long()
+                diff_rgb = self._cmap_lut[idx].permute(2,0,1).contiguous()
+
+                
                 pred_t = (pred[t].clamp(-1, 1) + 1) / 2
                 gt_t   = (gt[t].clamp(-1, 1) + 1) / 2
 
@@ -661,77 +666,80 @@ class CLAMTrainer(OfflineTrainer):
     @torch.no_grad()
     def make_correlation_vq(
         self,
-        ds_name: str,
+        ds_names,   # <-- str 또는 list[str]
         save_path: str = "results/vis/figure13_vq.png",
-        max_batches: int = 200,
-        max_points: int = 50000,
+        max_batches: int = 20000,   # <-- 이제 사용하지 않음 (호출 호환용)
+        max_points: int = 500000,
         wandb_prefix: str = "figures/",
     ):
         """
-        이미지 기반 CLAM + VQ가 이미 학습되어 있다는 가정 하에,
-        (action_x, action_y) 평면 위에 VQ code index를 색깔로 뿌려주는
-        Figure 13 스타일 플롯을 만들고, wandb에도 로그한다.
-
-        - ds_name: self.eval_ds 또는 self.train_ds에 들어 있는 키 이름
-        - save_path: 저장할 png 경로
+        ds_names: str 또는 [str, str, ...]
+        예) "chunk-000" 또는 ["chunk-000", "chunk-001", ..., "chunk-005"]
+        여러 dataset에서 모은 (action_x, action_y, code index)를 한 그림에 표시.
         """
+
+        # 1) 입력을 리스트 형태로 정규화
+        if isinstance(ds_names, str):
+            ds_names = [ds_names]
 
         self.model.eval()
 
-        # 1) 어떤 dataset 쓸지 고르기 (eval 우선, 없으면 train에서 찾기)
-        if hasattr(self, "eval_ds") and ds_name in self.eval_ds:
-            ds = self.eval_ds[ds_name]
-        elif hasattr(self, "train_ds") and ds_name in self.train_ds:
-            ds = self.train_ds[ds_name]
-        else:
-            raise ValueError(f"Unknown dataset name: {ds_name}")
-
-        it = ds.as_numpy_iterator()
-
         all_actions_xy = []
         all_codes = []
-        num_points = 0
+        num_points = 0  # 전체 point 개수만 체크
 
-        for b_idx, batch_np in enumerate(it):
-            if b_idx >= max_batches:
-                break
-
-            batch = to_device(batch_np, self.device)
-            batch = Batch(**batch)
-
-            # 2) 모델 forward → CLAMOutput
-            out = self.model(
-                batch.observations,
-                timesteps=batch.timestep,
-                states=batch.states,
-            )
-
-            idm_out = out.idm_output
-
-            # VQ 안 쓰는 모델이면 스킵
-            if (
-                idm_out is None
-                or idm_out.vq_outputs is None
-                or "indices" not in idm_out.vq_outputs
-            ):
+        # 2) 여러 dataset을 순차적으로 훑으면서 전부 모으기
+        for name in ds_names:
+            # 어떤 dataset 쓸지 고르기 (eval 우선, 없으면 train에서 찾기)
+            if hasattr(self, "eval_ds") and name in self.eval_ds:
+                ds = self.eval_ds[name]
+            elif hasattr(self, "train_ds") and name in self.train_ds:
+                ds = self.train_ds[name]
+            else:
+                log(f"[make_correlation_vq] Unknown dataset name: {name}, skip", "yellow")
                 continue
 
-            # indices: (B, T) 가정
-            codes = idm_out.vq_outputs["indices"]  # tensor
-            # action alignment: la[:,1:] ↔ actions[:, :-1]
-            codes = codes[:, 1:]                   # (B, T-1)
+            it = ds.as_numpy_iterator()
 
-            actions = batch.actions[:, :-1, :2]    # (B, T-1, 2)  only x,y
+            for batch_np in it:
+                # max_points만 기준으로 제한
+                if num_points >= max_points:
+                    break
 
-            # CPU + numpy로 변환
-            codes_np = codes.detach().cpu().numpy().reshape(-1)
-            acts_np = actions.detach().cpu().numpy().reshape(-1, 2)
+                batch = to_device(batch_np, self.device)
+                batch = Batch(**batch)
 
-            all_actions_xy.append(acts_np)
-            all_codes.append(codes_np)
+                # 3) 모델 forward → CLAMOutput
+                out = self.model(
+                    batch.observations,
+                    timesteps=batch.timestep,
+                    states=batch.states,
+                )
 
-            num_points += acts_np.shape[0]
-            if num_points >= max_points * 2:
+                idm_out = out.idm_output
+
+                # VQ 안 쓰면 스킵
+                if (
+                    idm_out is None
+                    or idm_out.vq_outputs is None
+                    or "indices" not in idm_out.vq_outputs
+                ):
+                    continue
+
+                codes = idm_out.vq_outputs["indices"]   # (B, T)
+                codes = codes[:, 1:]                    # (B, T-1), la[:,1:] ↔ actions[:, :-1]
+                actions = batch.actions[:, :-1, :2]     # (B, T-1, 2) only x,y
+
+                codes_np = codes.detach().cpu().numpy().reshape(-1)
+                acts_np = actions.detach().cpu().numpy().reshape(-1, 2)
+
+                all_actions_xy.append(acts_np)
+                all_codes.append(codes_np)
+
+                num_points += acts_np.shape[0]
+
+            # 이 dataset 다 돌았는데도 max_points를 채웠으면 더 이상 다른 ds 볼 필요 없음
+            if num_points >= max_points:
                 break
 
         if len(all_actions_xy) == 0:
@@ -741,7 +749,7 @@ class CLAMTrainer(OfflineTrainer):
         actions_xy = np.concatenate(all_actions_xy, axis=0)  # (N, 2)
         codes = np.concatenate(all_codes, axis=0)            # (N,)
 
-        # 전체가 너무 많으면 서브샘플링
+        # 너무 많으면 한 번 더 max_points 기준으로 서브샘플링 (안전장치)
         N = actions_xy.shape[0]
         if N > max_points:
             idx = np.random.choice(N, max_points, replace=False)
@@ -749,9 +757,9 @@ class CLAMTrainer(OfflineTrainer):
             codes = codes[idx]
             N = max_points
 
-        log(f"[make_correlation_vq] plotting {N} points", "green")
+        log(f"[make_correlation_vq] plotting {N} points from {ds_names}", "green")
 
-        # VQ vocab size 가져오기 (config → 모델 순으로 시도)
+        # ---- vocab_size 추론 ----
         vocab_size = None
         try:
             vocab_size = int(self.cfg.model.idm.vq.kwargs.codebook_size)
@@ -759,6 +767,21 @@ class CLAMTrainer(OfflineTrainer):
             if hasattr(self.model, "idm") and hasattr(self.model.idm, "vq"):
                 if hasattr(self.model.idm.vq, "codebook_size"):
                     vocab_size = int(self.model.idm.vq.codebook_size)
+        if vocab_size is None:
+            vocab_size = int(codes.max()) + 1
+
+        # ---- 서로 다른 색 + 진한 색 세팅 ----
+        def make_distinct_colors(n: int, s: float = 1.0, v: float = 1.0):
+            hues = np.linspace(0.0, 1.0, n, endpoint=False)
+            cols = [colorsys.hsv_to_rgb(h, s, v) for h in hues]
+            return np.array(cols)
+
+        color_array = make_distinct_colors(vocab_size, s=1.0, v=1.0)
+        cmap = mcolors.ListedColormap(color_array)
+        norm = mcolors.BoundaryNorm(
+            boundaries=np.arange(vocab_size + 1) - 0.5,
+            ncolors=cmap.N,
+        )
 
         plt.figure(figsize=(8, 8))
         sc = plt.scatter(
@@ -766,12 +789,19 @@ class CLAMTrainer(OfflineTrainer):
             actions_xy[:, 1],
             c=codes,
             s=4,
-            alpha=0.6,
-            cmap="tab20",
+            alpha=1.0,
+            cmap=cmap,
+            norm=norm,
         )
         plt.colorbar(sc, label="Latent Code Index")
 
-        title = f"Latent Action Correlation (Dataset: {ds_name})"
+        # title에 어떤 chunk들이 들어갔는지도 표시
+        if len(ds_names) == 1:
+            ds_str = ds_names[0]
+        else:
+            ds_str = ", ".join(ds_names)
+
+        title = f"Latent Action Correlation (Datasets: {ds_str})"
         if vocab_size is not None:
             title += f"\nVocab Size: {vocab_size}"
         plt.title(title)
@@ -786,15 +816,21 @@ class CLAMTrainer(OfflineTrainer):
 
         log(f"[make_correlation_vq] saved figure to {save_path}", "green")
 
-        # wandb에 이미지 로그
+        # --- 안전하게 wandb 로그하기 ---
         if hasattr(self, "log_to_wandb"):
-            self.log_to_wandb(
-                {f"{wandb_prefix}figure13_{ds_name}": wandb.Image(save_path)}
-            )
-            log(
-                f"[make_correlation_vq] logged to wandb as {wandb_prefix}figure13_{ds_name}",
-                "green",
-            )
+            key = f"{wandb_prefix}figure13_{'_'.join(ds_names)}"
+
+            if not os.path.exists(save_path):
+                log(f"[make_correlation_vq] file not found for wandb: {save_path}", "red")
+            elif os.path.getsize(save_path) == 0:
+                log(f"[make_correlation_vq] file is empty for wandb: {save_path}", "red")
+            else:
+                try:
+                    img = wandb.Image(save_path)
+                    self.log_to_wandb({key: img})
+                    log(f"[make_correlation_vq] logged to wandb as {key}", "green")
+                except Exception as e:
+                    log(f"[make_correlation_vq] wandb.Image failed: {e}", "red")
 
         return save_path
 
@@ -888,9 +924,10 @@ class CLAMTrainer(OfflineTrainer):
             log(f"visualizing video = {path}", "blue")
 
             # Figure 13 (action 2D + VQ codes)
+            chunk_list = [f"chunk-00{i}" for i in range(5)]  # ["chunk-000", ..., "chunk-004"]
             self.make_correlation_vq(
-                ds_name=video_target,  # 같은 eval dataset 사용
-                save_path="results/vis/figure13_vq.png",
+                ds_names=chunk_list,
+                save_path="results/vis/figure13_vq_chunks000_005.png",
                 max_batches=200,
                 max_points=50000,
             )

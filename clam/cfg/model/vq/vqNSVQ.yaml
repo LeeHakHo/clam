@@ -7,7 +7,7 @@ hp_name: ${.name}_cb-${.kwargs.codebook_size}-th-${.kwargs.discarding_threshold}
 
 kwargs:
   # --- 기존 CLAM 쪽에서 기대하는 이름 (SpaceTimeIDM에서 num_embeddings로 매핑해줌) ---
-  codebook_size: 8          # => NSVQ.num_embeddings 로 변환됨
+  codebook_size: 16          # => NSVQ.num_embeddings 로 변환됨
 
   # --- NSVQ 고유 하이퍼파라미터 ---
   embedding_dim: 256        # NSVQ 내부 codebook / CNN 채널 차원

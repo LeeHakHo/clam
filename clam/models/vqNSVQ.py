@@ -8,7 +8,7 @@ import torch.distributions.uniform as uniform_dist
 ## add project_in, project_out layer 
 ## FYI vector_quantize_pytorch
 class NSVQ(torch.nn.Module):
-    def __init__(self, dim, num_embeddings, embedding_dim, device=torch.device('cpu'), discarding_threshold=0.1, initialization='normal', code_seq_len=1, patch_size=32, image_size = 256):
+    def __init__(self, dim, num_embeddings, embedding_dim, device=torch.device('cpu'), discarding_threshold=0.1, initialization='normal', code_seq_len=1, patch_size=32, image_size = 256, is_vector_input=True):
         super().__init__()  # super(NSVQ, self) -> 버그라서 수정
 
         """
@@ -35,6 +35,9 @@ class NSVQ(torch.nn.Module):
         self.eps = 1e-12
         self.dim = dim
         self.patch_size = patch_size
+        
+        # [Fixed] Must store this variable to use it in encode/decode later
+        self.is_vector_input = is_vector_input 
 
         if initialization == 'normal':
             codebooks = torch.randn(self.num_embeddings, self.embedding_dim, device=device)
@@ -53,61 +56,74 @@ class NSVQ(torch.nn.Module):
         
         # 8 * 8  => 4 * 4 => 2 * 2
         #assert patch_size == 32
-        if code_seq_len == 1:
-            self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),
-                torch.nn.ReLU(),
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=4, stride=1, padding=0),
-            )
-        elif code_seq_len == 2:
-            self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),
-                torch.nn.ReLU(),
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=(3, 4), stride=1, padding=0),
-            )
-            
-        elif code_seq_len == 4:
-            self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),
-                torch.nn.ReLU(),
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=1, padding=0),
-            )
-        elif code_seq_len == 16:
-            self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 16x16 -> 8x8
-                torch.nn.ReLU(),
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 8x8 -> 4x4
-            )
-        elif code_seq_len == 64:
-            self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 16x16 -> 8x8
-            )
-        elif code_seq_len == 256:
-            self.cnn_encoder = torch.nn.Sequential(
-                torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 32x32 -> 16x16
-            )
+
+        # [Fixed] Logic to bypass CNN for vector inputs
+        if self.is_vector_input:
+            self.cnn_encoder = torch.nn.Identity()
         else:
-            raise ValueError("Not Implement: code_seq_len should be one of the 1 and 4 integers")
+            if code_seq_len == 1:
+                self.cnn_encoder = torch.nn.Sequential(
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),
+                    torch.nn.ReLU(),
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=4, stride=1, padding=0),
+                )
+            elif code_seq_len == 2:
+                self.cnn_encoder = torch.nn.Sequential(
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),
+                    torch.nn.ReLU(),
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=(3, 4), stride=1, padding=0),
+                )
+                
+            elif code_seq_len == 4:
+                self.cnn_encoder = torch.nn.Sequential(
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),
+                    torch.nn.ReLU(),
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=1, padding=0),
+                )
+            elif code_seq_len == 16:
+                self.cnn_encoder = torch.nn.Sequential(
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 16x16 -> 8x8
+                    torch.nn.ReLU(),
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 8x8 -> 4x4
+                )
+            elif code_seq_len == 64:
+                self.cnn_encoder = torch.nn.Sequential(
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 16x16 -> 8x8
+                )
+            elif code_seq_len == 256:
+                self.cnn_encoder = torch.nn.Sequential(
+                    torch.nn.Conv2d(in_channels=embedding_dim, out_channels=embedding_dim, kernel_size=3, stride=2, padding=1),  # 32x32 -> 16x16
+                )
+            else:
+                raise ValueError("Not Implement: code_seq_len should be one of the 1 and 4 integers")
 
     def encode(self, input_data, batch_size):
-        # compute the distances between input and codebooks vectors
-        input_data = self.project_in(input_data) # b * 64 * 32
-        # change the order of the input_data to b * 32 * 64
-        input_data = input_data.permute(0, 2, 1).contiguous()
-        # reshape input_data to 4D b*h*w*d
-        input_data = input_data.reshape(batch_size, self.embedding_dim, int(self.image_size/self.patch_size), int(self.image_size/self.patch_size))
-        input_data = self.cnn_encoder(input_data) # 1*1 tensor
-        input_data = input_data.reshape(batch_size, self.embedding_dim, -1) # b * 32 * d^2
-        input_data = input_data.permute(0, 2, 1).contiguous() # b * 1 * 32
-        input_data = input_data.reshape(-1, self.embedding_dim)
-        return input_data
+        # [Fixed] Handle vector inputs without reshaping to 4D
+        if self.is_vector_input:
+            input_data = self.project_in(input_data)
+            return input_data
+        else:
+            # compute the distances between input and codebooks vectors
+            input_data = self.project_in(input_data) # b * 64 * 32
+            # change the order of the input_data to b * 32 * 64
+            input_data = input_data.permute(0, 2, 1).contiguous()
+            # reshape input_data to 4D b*h*w*d
+            input_data = input_data.reshape(batch_size, self.embedding_dim, int(self.image_size/self.patch_size), int(self.image_size/self.patch_size))
+            input_data = self.cnn_encoder(input_data) # 1*1 tensor
+            input_data = input_data.reshape(batch_size, self.embedding_dim, -1) # b * 32 * d^2
+            input_data = input_data.permute(0, 2, 1).contiguous() # b * 1 * 32
+            input_data = input_data.reshape(-1, self.embedding_dim)
+            return input_data
     
     def decode(self, quantized_input, batch_size):
-        quantized_input = quantized_input.reshape(batch_size, self.embedding_dim, -1) # b * 32 * d^2
-        quantized_input = quantized_input.permute(0, 2, 1).contiguous() # b * 64 * 32
-        
-        quantized_input = self.project_out(quantized_input)
-        return quantized_input
+        # [Fixed] Handle vector inputs without reshaping
+        if self.is_vector_input:
+            return self.project_out(quantized_input)
+        else:
+            quantized_input = quantized_input.reshape(batch_size, self.embedding_dim, -1) # b * 32 * d^2
+            quantized_input = quantized_input.permute(0, 2, 1).contiguous() # b * 64 * 32
+            quantized_input = self.project_out(quantized_input)
+            return quantized_input
     
     def forward(self, input_data_first, input_data_last, codebook_training_only=False):
 
@@ -129,6 +145,7 @@ class NSVQ(torch.nn.Module):
         
         input_data_first = input_data_first.contiguous()
         
+        # [Note] Encode is now aware of is_vector_input
         input_data_first = self.encode(input_data_first, batch_size) # b * 1 * 32
         input_data_last = self.encode(input_data_last, batch_size) # b * 1 * 32
         
@@ -151,7 +168,7 @@ class NSVQ(torch.nn.Module):
         vq_error = (norm_quantization_residual / norm_random_vector + self.eps) * random_vector
 
         if codebook_training_only:
-            print(f"codebook error: {norm_quantization_residual.norm()}")
+            # print(f"codebook error: {norm_quantization_residual.norm()}")
             quantized_input = hard_quantized_input
         else:
             quantized_input = input_data + vq_error
@@ -171,6 +188,7 @@ class NSVQ(torch.nn.Module):
         # Also notice you do not need to add a new loss term (for VQ) to your global loss function to optimize codebooks.
         # Just return the tensor of "quantized_input" as vector quantized version of the input data.
         
+        # [Note] Decode is now aware of is_vector_input
         quantized_input = self.decode(quantized_input, batch_size)
         return quantized_input, perplexity, self.codebooks_used.cpu().numpy(), min_indices.reshape(batch_size, -1)
 
@@ -281,5 +299,3 @@ class NSVQ(torch.nn.Module):
     def codebook_reinit(self):
         self.codebooks = torch.nn.Parameter(torch.randn(self.num_embeddings, self.embedding_dim, device=self.device), requires_grad=True)
         self.codebooks_used = torch.zeros(self.num_embeddings, dtype=torch.int32, device=self.device)
-        
-        
