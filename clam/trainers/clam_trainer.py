@@ -80,42 +80,45 @@ class CLAMTrainer(OfflineTrainer):
         # ---------------------------------------------------------------------
         # [Fix] Video Evaluation Dataset Setup
         # ---------------------------------------------------------------------
+        # 1) eval group 경로
         eval_ds_path = getattr(self.cfg.env, "eval_dataset_name", self.cfg.env.dataset_name)
-        eval_ds_list = getattr(self.cfg.env, "eval_datasets", getattr(self.cfg.env, "datasets", []))
 
-        # 2. 비디오 생성에 쓸 "단 하나의 청크 이름" 파싱 (공백 제거 포함)
-        if isinstance(eval_ds_list, (list, tuple)) and len(eval_ds_list) > 0:
-            target_chunk = eval_ds_list[0]
-        elif isinstance(eval_ds_list, str):
-            target_chunk = eval_ds_list.strip("[]' ").split(",")[0].strip()
-        else:
-            target_chunk = "chunk-000"
+        # 2) eval dataset 리스트(실제 이름들)
+        eval_ds_list = getattr(self.cfg.env, "eval_datasets", None)
+        if eval_ds_list is None or len(eval_ds_list) == 0:
+            eval_ds_list = getattr(self.cfg.env, "datasets", [])
 
-        self.video_ds_name = target_chunk
-        
-        log(f"[VideoEval] Path: '{eval_ds_path}', Target Chunk: '{self.video_ds_name}'", "blue")
+        # 3) 비디오용으로 “실제 존재하는” 첫 번째 eval dataset 선택
+        self.video_ds_name = eval_ds_list[0]
 
-        # 3. 데이터 로더용 임시 Config
+        log(f"[VideoEval] Path: '{eval_ds_path}', Target Dataset: '{self.video_ds_name}'", "blue")
+
         cfg2 = copy.deepcopy(self.cfg)
         cfg2.data.shuffle = False
-        
-        # [중요] 길이가 짧은 데이터 처리 및 로딩 확률 높이기
         cfg2.data.batch_size = 1
-        cfg2.data.num_trajs = 10 
+        cfg2.data.num_trajs = 10
         cfg2.data.num_examples = -1
-        cfg2.data.pad_dataset = True 
+        cfg2.data.pad_dataset = True
 
         cfg2.env.dataset_name = eval_ds_path
         cfg2.env.datasets = [self.video_ds_name]
-
-        # 4. get_dataloader 호출
-        ds_dict, *_ = get_dataloader(
-            cfg=cfg2,
-            dataset_names=[self.video_ds_name],
-            dataset_split=[1],
-            shuffle=False,
-        )
-
+        try:
+            ds_dict, *_ = get_dataloader(
+                cfg=cfg2,
+                dataset_names=[self.video_ds_name],
+                dataset_split=[1],
+                shuffle=False,
+            )
+        except tf.errors.NotFoundError:
+            log("[VideoEval] cache missing -> retry with use_cache=False", "yellow")
+            cfg2.data.use_cache = False
+            ds_dict, *_ = get_dataloader(
+                cfg=cfg2,
+                dataset_names=[self.video_ds_name],
+                dataset_split=[1],
+                shuffle=False,
+            )
+            
         if not ds_dict:
             log(f"[VideoEval] Failed to load chunk '{self.video_ds_name}'. Dictionary is empty.", "red")
             self.video_seq_ds = None
@@ -389,44 +392,54 @@ class CLAMTrainer(OfflineTrainer):
 
     @torch.no_grad()
     def make_dreamer_rollout_video(self, ds_name: str, save_path: str, context_len: int = 5, fps: int = 8, max_steps: int = 50):
-        if not hasattr(self, "video_seq_ds") or self.video_seq_ds is None: return None
+        """
+        ✅ [Fix #3]
+        - model/gt 스케일을 [-1,1]로 가정하고,
+        시각화할 때만 (x+1)/2 로 [0,1] 변환
+        """
+        if not hasattr(self, "video_seq_ds") or self.video_seq_ds is None:
+            return None
+
         seq_ds = self.video_seq_ds
         it = seq_ds.as_numpy_iterator()
 
         full_gt_seq = []
         try:
             first_batch = next(it)
-            obs_chunk = first_batch['observations'][0]
+            obs_chunk = first_batch["observations"][0]
             for i in range(obs_chunk.shape[0]):
                 full_gt_seq.append(torch.tensor(obs_chunk[i]))
         except StopIteration:
             return None
 
-        # Collect enough frames
         while len(full_gt_seq) < max_steps + 5:
             try:
                 batch_np = next(it)
-                last_obs = torch.tensor(batch_np['observations'][0, -1])
+                last_obs = torch.tensor(batch_np["observations"][0, -1])
                 full_gt_seq.append(last_obs)
             except StopIteration:
                 break
-        
-        if len(full_gt_seq) < 2: return None
+
+        if len(full_gt_seq) < 2:
+            return None
+
         gt_seq = torch.stack(full_gt_seq).to(self.device)[:max_steps]
 
-        if not hasattr(self.model, "visualize_dreamer_style_rollout"): return None
+        if not hasattr(self.model, "visualize_dreamer_style_rollout"):
+            return None
         try:
             recons = self.model.visualize_dreamer_style_rollout(gt_seq, context_len=context_len)
         except Exception as e:
             log(f"[DreamerVis] Error: {e}", "red")
             return None
 
-        if recons is None or len(recons) == 0: return None
+        if recons is None or len(recons) == 0:
+            return None
 
         T_pred = recons.shape[0]
-        gt_match = gt_seq[1 : 1 + T_pred]
+        gt_match = gt_seq[1 : 1 + T_pred]  # GT frame 1.. align
+
         frames = []
-        
         self._ensure_cmap_lut("magma")
         if self._cmap_lut.device != recons.device:
             self._cmap_lut = self._cmap_lut.to(device=recons.device, dtype=recons.dtype)
@@ -434,19 +447,26 @@ class CLAMTrainer(OfflineTrainer):
         diff_all = (recons - gt_match).abs().mean(dim=1, keepdim=True)
         vmax = diff_all.max().clamp(min=1e-8)
 
+        def to_disp(x):
+            # [-1,1] -> [0,1]
+            return (x.clamp(-1, 1) + 1) / 2
+
         for t in range(T_pred):
-            recon_t = recons[t].clamp(0, 1) 
-            gt_t = (gt_match[t].clamp(-1, 1) + 1) / 2 
-            
+            recon_raw = recons[t]
+            gt_raw = gt_match[t]
+
             diff_t = (diff_all[t] / vmax).clamp(0, 1)
             idx = (diff_t.squeeze(0) * 255).long().clamp(0, 255)
             diff_rgb = self._cmap_lut[idx].permute(2, 0, 1)
 
+            recon_t = to_disp(recon_raw)
+            gt_t = to_disp(gt_raw)
+
             current_step = t + 1
             is_context = current_step < context_len
             color = torch.tensor([0.0, 1.0, 0.0], device=recons.device) if is_context else torch.tensor([1.0, 0.0, 0.0], device=recons.device)
-            border = color.view(3, 1, 1).repeat(1, 3, recon_t.shape[2]) 
-            recon_t[:, :3, :] = border 
+            border = color.view(3, 1, 1).repeat(1, 3, recon_t.shape[2])
+            recon_t[:, :3, :] = border
 
             tile = torch.stack([diff_rgb, recon_t, gt_t], dim=0)
             grid = torchvision.utils.make_grid(tile, nrow=3, padding=2)
@@ -464,39 +484,51 @@ class CLAMTrainer(OfflineTrainer):
 
     @torch.no_grad()
     def target_vis(self, sample_dataloader):
+        """
+        ✅ [Fix #3]
+        - pred/gt를 [-1,1]로 보고 diff 계산
+        - 시각화는 (x+1)/2 로 [0,1] 변환해서 보여줌
+        """
         batch = self._take_one_batch(sample_dataloader)
         b = 0
         if self.use_transformer:
             out = self.model(batch.observations, timesteps=batch.timestep, states=batch.states)
-            # [BUG FIX] Removed ':-1' slicing here too
-            pred = out.reconstructed_obs[b]       # (T-1, C, H, W)
-            gt   = batch.observations[b, 1:]      # (T-1, C, H, W)
+            pred = out.reconstructed_obs[b]   # (T-1,C,H,W)
+            gt   = batch.observations[b, 1:]  # (T-1,C,H,W)
         else:
             out  = self.model(batch.observations)
             pred = out.reconstructed_obs[b][None]
-            gt   = batch.observations[b, -1: ]
+            gt   = batch.observations[b, -1:]
 
         if self.cfg.env.n_frame_stack > 1:
             C = pred.shape[-3]
             pred = pred[:, C-3:C]; gt = gt[:, C-3:C]
 
         diff = (pred - gt).abs().mean(dim=1, keepdim=True)
+
         self._ensure_cmap_lut("magma")
         self._cmap_lut = self._cmap_lut.to(device=pred.device, dtype=pred.dtype)
-        
+
         vmax = diff.max().clamp(min=1e-8)
         tiles = []
+
+        def to_disp(x):
+            return (x.clamp(-1, 1) + 1) / 2
+
         for t in range(pred.shape[0]):
             diff_t = (diff[t] / vmax).clamp(0, 1)
-            idx = (diff_t.squeeze(0) * 255).round().long()
+            idx = (diff_t.squeeze(0) * 255).round().long().clamp(0, 255)
             diff_rgb = self._cmap_lut[idx].permute(2, 0, 1).contiguous()
-            pred_t = torch.clamp(pred[t], 0, 1)
-            gt_t   = torch.clamp(gt[t],   0, 1)
+
+            pred_t = to_disp(pred[t])
+            gt_t   = to_disp(gt[t])
+
             tiles += [diff_rgb, pred_t, gt_t]
 
         grid = torchvision.utils.make_grid(torch.stack(tiles, dim=0), nrow=3)
         grid = einops.rearrange(grid, "c h w -> h w c")
         return (torch.clamp(grid, 0, 1) * 255).byte().cpu().numpy()
+
 
     # (make_correlation_vq 등은 기존과 동일)
     @torch.no_grad()
