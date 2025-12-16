@@ -1,0 +1,30 @@
+num_updates: 200_000
+# log_interval: 100
+name: tssm_clam
+
+#Hayden - Customize WanDB name
+base_hp_name: AL-${env.dataset_name}_NT-${num_labelled_trajs}_SN-${seed}
+hp_name: ${resolve_lapa_ckpt_name:${base_hp_name}_${env.hp_name}}
+
+
+action_decoder_bs: 64
+
+env:
+  n_frame_stack: 1
+  image_obs: True
+  image_shape: [128, 128] #240/240
+
+data:
+  batch_size: 4 #128
+
+model:
+  context_len: 16 #2->32 #Hayden
+  la_dim: 16
+  concatenate_gripper_state: False
+
+defaults:
+  - train_clam
+  - override modules/encoder: st_transformer
+  - override modules/decoder: st_transformer
+  - override model: st_vivit_clam
+  - _self_

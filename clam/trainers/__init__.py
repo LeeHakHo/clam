@@ -23,4 +23,5 @@ trainer_to_cls = {
     "vpt": VPTTrainer,
     "vpt_bc": VPTBCTrainer,
     "nsvq_clam": CLAMTrainer, #Hayden
+    "tssm_clam": CLAMTrainer, #Hayden
 }

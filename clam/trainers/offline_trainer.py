@@ -1,8 +1,6 @@
 import collections
 import time
-import types
 from collections import defaultdict
-from functools import partial
 
 import numpy as np
 import torch
@@ -22,9 +20,14 @@ class OfflineTrainer(BaseTrainer):
         super().__init__(cfg)
         self.train_step = 0
 
+        # ✅ eval iterator 반드시 초기화 (repeat로 StopIteration 방지)
+        self._eval_iter = self.eval_dataloader.repeat().as_numpy_iterator()
+
     def train(self):
-        #first eval
-        if not self.cfg.skip_first_eval:
+        # ✅ accelerate면 main process만 eval 돌리기 (중복/충돌 방지)
+        if (not self.cfg.skip_first_eval) and (
+            (not self.cfg.accelerate.use) or self.accelerator.is_main_process
+        ):
             self.eval(step=0)
 
         self.model.train()
@@ -40,13 +43,13 @@ class OfflineTrainer(BaseTrainer):
             total=self.cfg.num_updates,
         ):
             batch_load_time = time.time()
-            batch = next(train_iter)
-            # put the batch on the device
-            batch = gutl.to_device(batch, self.device)
-            batch_load_time = time.time() - batch_load_time
-            batch = Batch(**batch)
+            batch_np = next(train_iter)
 
-            # perform a single gradient step
+            # put the batch on the device
+            batch_np = gutl.to_device(batch_np, self.device)
+            batch_load_time = time.time() - batch_load_time
+            batch = Batch(**batch_np)
+
             update_time = time.time()
 
             self.optimizer.zero_grad()
@@ -77,7 +80,6 @@ class OfflineTrainer(BaseTrainer):
 
                 self.scaler.scale(total_loss).backward()
 
-                # Unscale gradients to prepare for gradient clipping
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), max_norm=self.cfg.clip_grad_norm
@@ -97,57 +99,41 @@ class OfflineTrainer(BaseTrainer):
 
                 self.scaler.update()
 
-            # step the scheduler at the end of everything
             self.scheduler.step()
 
             metrics["time/batch_load"] = batch_load_time
             metrics["time/update"] = time.time() - update_time
-
-            # get lr
             metrics["lr"] = self.scheduler.get_last_lr()[0]
 
             if hasattr(self, "action_decoder_scheduler"):
-                action_decoder_lr = self.action_decoder_scheduler.get_last_lr()[0]
-                metrics["action_decoder_lr"] = action_decoder_lr
+                metrics["action_decoder_lr"] = self.action_decoder_scheduler.get_last_lr()[0]
 
             self.log_to_wandb(metrics, prefix="train/")
 
-            #Hayden - Temporarily commented out to speed up training
-            # #log stats about the model params
-            # param_stats = defaultdict(float)
-            # for name, param in self.model.named_parameters():
-            #     param_stats[f"{name}_mean"] = param.mean().item()
-            #     param_stats[f"{name}_std"] = param.std().item()
-
-            # self.log_to_wandb(param_stats, prefix="params/")
-
-            # #log a step counter for wandb
-            # self.log_to_wandb({"_update": self.train_step}, prefix="step/")
-
-
-            # run evaluation for each evaluation environment
-            if (not self.cfg.accelerate.use) or self.accelerator.is_main_process: #Hayden
+            # ✅ eval은 main process만
+            if (not self.cfg.accelerate.use) or self.accelerator.is_main_process:
                 if ((self.train_step + 1) % self.eval_every) == 0:
                     self.eval(step=self.train_step + 1)
-
-                    # after eval set model back to train
                     self.model.train()
                     if hasattr(self, "action_decoder"):
                         self.action_decoder.train()
 
-                # log to terminal
                 if ((self.train_step + 1) % self.cfg.log_terminal_every) == 0:
                     log(f"step: {self.train_step}, train:")
                     log(f"{pretty_repr(metrics)}")
 
-
-        # final evaluation
-        self.eval(step=self.cfg.num_updates)
+        # final evaluation (main만)
+        if (not self.cfg.accelerate.use) or self.accelerator.is_main_process:
+            self.eval(step=self.cfg.num_updates)
 
         if self.wandb_run is not None:
             self.wandb_run.finish()
 
     def eval(self, step: int):
+        # ✅ accelerate면 main process만 eval
+        if self.cfg.accelerate.use and (not self.accelerator.is_main_process):
+            return {}
+
         log("running evaluation", "blue")
 
         self.model.eval()
@@ -155,42 +141,39 @@ class OfflineTrainer(BaseTrainer):
             self.action_decoder.eval()
 
         eval_time = time.time()
-        #eval_iter = self.eval_dataloader.as_numpy_iterator()
-
-        #Hayden
         eval_metrics = collections.defaultdict(list)
+
+        # ✅ 혹시라도 iterator가 None/없으면 복구
+        if not hasattr(self, "_eval_iter") or self._eval_iter is None:
+            self._eval_iter = self.eval_dataloader.repeat().as_numpy_iterator()
+
         for _ in range(self.num_eval_batches):
             batch_np = next(self._eval_iter)
-            batch = gutl.to_device(batch_np, self.device)
-            batch = Batch(**batch)
+            batch_np = gutl.to_device(batch_np, self.device)
+            batch = Batch(**batch_np)
 
             with torch.no_grad():
-                metrics, total_eval_loss = self.compute_loss(batch, train=False)
+                metrics, _total_eval_loss = self.compute_loss(batch, train=False)
 
             for k, v in metrics.items():
                 if isinstance(v, torch.Tensor):
                     v = v.detach().cpu().item()
                 eval_metrics[k].append(v)
 
-            # to prevent OOM
             del batch
             del batch_np
 
-        # average metrics over all eval batches
         for k, v in eval_metrics.items():
-            eval_metrics[k] = np.mean(np.array(v))
+            eval_metrics[k] = float(np.mean(np.array(v)))
 
         eval_metrics["time"] = time.time() - eval_time
-
         self.log_to_wandb(eval_metrics, prefix="eval/")
 
-        # write evaluation metrics to log file
         with open(self.log_dir / "eval.txt", "a+") as f:
             f.write(f"{step}, {eval_metrics}\n")
 
         log(f"eval: {pretty_repr(eval_metrics)}")
 
-        # run evaluation rollouts
         if self.cfg.run_eval_rollouts:
             rollout_metrics, *_ = run_eval_rollouts(
                 cfg=self.cfg, model=self.model, wandb_run=self.wandb_run
@@ -202,6 +185,5 @@ class OfflineTrainer(BaseTrainer):
 
             log(f"eval rollout: {pretty_repr(rollout_metrics)}")
 
-        # also save model here
         self.save_model(ckpt_dict=self.save_dict, metrics=eval_metrics, iter=step)
         return eval_metrics
