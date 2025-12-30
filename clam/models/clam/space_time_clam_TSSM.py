@@ -50,9 +50,11 @@ class CLAMWorldModel(nn.Module):
     CLAM용 World Model (TSSM/RSSM 스타일)
       posterior: q(z_t | o_t)
       prior:     p(z_t | z_{t-1}, a_t)  (Transformer로 deter 만들고 prior param)
+
     output:
       wm_cond: [B, T-1, model_dim]  (FDM에 additive conditioning)
       kl: scalar (Dreamer-style balanced KL)
+      pred_loss: scalar (WM prediction/recon loss, e.g., MSE on img_embed)
     """
 
     def __init__(self, model_dim: int, la_dim: int, cfg: Optional[DictConfig] = None):
@@ -70,6 +72,13 @@ class CLAMWorldModel(nn.Module):
         self.kl_balance = float(getattr(cfg, "kl_balance", 0.8))
         self.free_nats = float(getattr(cfg, "free_nats", 1.0))
         self.temp = float(getattr(cfg, "temp", 1.0))
+
+        # (2) WM prediction loss scale
+        self.pred_scale = float(getattr(cfg, "pred_scale", 1.0))
+
+        # (1) WM positional embedding
+        self.max_seq_len = int(getattr(cfg, "max_seq_len", 512))
+        self.pos_emb = nn.Embedding(self.max_seq_len, self.d_model)
 
         # robot_state 사용 안 함
         self.use_robot_state = False
@@ -113,6 +122,15 @@ class CLAMWorldModel(nn.Module):
         # FDM conditioning feature
         self.feature_proj = nn.Linear(self.z_dim + self.d_model, model_dim)
 
+        # (2) WM recon/pred head: predict img_embed(o_t) from (z_t, deter_t)
+        self.pred_net = nn.Sequential(
+            nn.Linear(self.z_dim + self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, model_dim),
+        )
+
         self.min_logstd = -6.0
         self.max_logstd = 2.0
 
@@ -128,10 +146,23 @@ class CLAMWorldModel(nn.Module):
         return z, mu, logstd
 
     def infer_prior_deter(self, prev_z: torch.Tensor, a: torch.Tensor):
-        tokens = torch.cat([prev_z, a], dim=-1)         # [B,T-1,z+a]
-        tokens = self.in_proj(tokens)                   # [B,T-1,d_model]
-        mask = _causal_mask(tokens.size(1), tokens.device)
-        deter = self.trans(tokens, mask=mask)           # [B,T-1,d_model]
+        """
+        prev_z: [B, T-1, z_dim]
+        a:      [B, T-1, la_dim]
+        deter:  [B, T-1, d_model]
+        """
+        tokens = torch.cat([prev_z, a], dim=-1)         # [B, T-1, z+a]
+        tokens = self.in_proj(tokens)                   # [B, T-1, d_model]
+
+        # (1) add positional embedding (learned)
+        Tm1 = tokens.size(1)
+        if Tm1 > self.max_seq_len:
+            raise RuntimeError(f"Sequence length {Tm1} exceeds max_seq_len={self.max_seq_len}. Increase wm.max_seq_len.")
+        pos = torch.arange(Tm1, device=tokens.device).unsqueeze(0)  # [1, T-1]
+        tokens = tokens + self.pos_emb(pos)                          # [B, T-1, d_model]
+
+        mask = _causal_mask(Tm1, tokens.device)
+        deter = self.trans(tokens, mask=mask)                        # [B, T-1, d_model]
         return deter
 
     def infer_prior(self, deter: torch.Tensor):
@@ -141,34 +172,33 @@ class CLAMWorldModel(nn.Module):
         return mu, logstd
 
     def compute_kl(self, post_mu, post_logstd, prior_mu, prior_logstd):
-        kl_lhs = diag_gaussian_kl(post_mu, post_logstd, prior_mu.detach(), prior_logstd.detach())
-        kl_rhs = diag_gaussian_kl(post_mu.detach(), post_logstd.detach(), prior_mu, prior_logstd)
+        """
+        (6) free_nats를 원소별 clamp 후 mean으로 변경
+        """
+        kl_lhs = diag_gaussian_kl(post_mu, post_logstd, prior_mu.detach(), prior_logstd.detach())  # [B, T-1]
+        kl_rhs = diag_gaussian_kl(post_mu.detach(), post_logstd.detach(), prior_mu, prior_logstd)  # [B, T-1]
 
-        kl_lhs = torch.maximum(kl_lhs.mean(), kl_lhs.new_tensor(self.free_nats))
-        kl_rhs = torch.maximum(kl_rhs.mean(), kl_rhs.new_tensor(self.free_nats))
+        free = kl_lhs.new_tensor(self.free_nats)
+        kl_lhs = torch.clamp(kl_lhs, min=free).mean()
+        kl_rhs = torch.clamp(kl_rhs, min=free).mean()
 
         kl = (1.0 - self.kl_balance) * kl_lhs + self.kl_balance * kl_rhs
         return self.kl_scale * kl
 
     def predict_next_deter(self, z_history: torch.Tensor, a_history: torch.Tensor):
         """
-        [New] Rollout용: 과거 히스토리를 받아 다음 스텝의 deter(h_t)를 예측
+        Rollout용: 과거 히스토리를 받아 다음 스텝의 deter(h_t)를 예측
         z_history: [B, T_past, z_dim] (z_{0:t-1})
         a_history: [B, T_past, la_dim] (a_{1:t})
         return: last_deter [B, 1, d_model]
         """
-        # Transformer Input: z_{0:t-1} and a_{1:t}
-        # Output: deter_{1:t}
         deter_seq = self.infer_prior_deter(z_history, a_history)
-        
-        # We only need the last one (deter_t)
         return deter_seq[:, -1:]
 
     def get_cond(self, z_t: torch.Tensor, deter_t: torch.Tensor):
         """
-        [New] z_t와 deter_t를 결합하여 FDM Condition 생성
-        z_t: [B, 1, z_dim] (Posterior or Prior sample at time t)
-        deter_t: [B, 1, d_model] (Deterministic state at time t)
+        z_t: [B, 1, z_dim]
+        deter_t: [B, 1, d_model]
         """
         return self.feature_proj(torch.cat([z_t, deter_t], dim=-1))
 
@@ -178,14 +208,14 @@ class CLAMWorldModel(nn.Module):
         la_delta: torch.Tensor,          # [B,T,la_dim] (t=0 pad 포함)
         robot_state: Optional[torch.Tensor] = None,
     ):
-        o = self.fuse_observation(img_embed, robot_state)
+        o = self.fuse_observation(img_embed, robot_state)  # [B,T,model_dim]
 
         # posterior q(z_t|o_t)
         z_post, post_mu, post_logstd = self.infer_posterior(o)     # [B,T,z]
 
         # prior uses t=1..T-1: p(z_t | z_{t-1}, a_t)
-        prev_z = z_post[:, :-1]     # z_{t-1}
-        a = la_delta[:, 1:]         # a_t
+        prev_z = z_post[:, :-1]     # z_{t-1}  [B,T-1,z]
+        a = la_delta[:, 1:]         # a_t      [B,T-1,a]
         deter = self.infer_prior_deter(prev_z, a)                  # [B,T-1,d_model]
         prior_mu, prior_logstd = self.infer_prior(deter)           # [B,T-1,z]
 
@@ -193,9 +223,14 @@ class CLAMWorldModel(nn.Module):
         kl = self.compute_kl(post_mu[:, 1:], post_logstd[:, 1:], prior_mu, prior_logstd)
 
         # conditioning feature for FDM
-        # CAUTION: Here we use z_t (CURRENT) and deter (CURRENT context)
+        # (5번 요청 제외 -> 그대로 z_post 샘플 사용)
         z_t = z_post[:, 1:]                                             # [B,T-1,z]
         wm_cond = self.feature_proj(torch.cat([z_t, deter], dim=-1))     # [B,T-1,model_dim]
+
+        # (2) WM prediction loss: predict o_t(img_embed_t) from (z_t, deter_t)
+        pred_o = self.pred_net(torch.cat([z_t, deter], dim=-1))          # [B,T-1,model_dim]
+        target_o = o[:, 1:]                                              # [B,T-1,model_dim]
+        pred_loss = F.mse_loss(pred_o, target_o)
 
         dbg = {
             "z_post": z_post,
@@ -204,8 +239,9 @@ class CLAMWorldModel(nn.Module):
             "post_logstd": post_logstd,
             "prior_mu": prior_mu,
             "prior_logstd": prior_logstd,
+            "pred_o": pred_o,
         }
-        return wm_cond, kl, dbg
+        return wm_cond, kl, self.pred_scale * pred_loss, dbg
 
 
 # =========================================================
@@ -240,6 +276,17 @@ class SpaceTimeIDM(BaseModel):
         )
 
         self.ln_pre_head = nn.LayerNorm(self.model_dim)
+
+        # (4) IDM pair 방식 action head: (e_{t-1}, e_t) -> a_t
+        self.la_pair_head = nn.Sequential(
+            nn.Linear(self.model_dim * 2, self.model_dim),
+            nn.GELU(),
+            nn.Linear(self.model_dim, self.model_dim),
+            nn.GELU(),
+            nn.Linear(self.model_dim, self.la_dim),
+        )
+
+        # VQ를 계속 쓰려면 la_cont도 필요(기존 NSVQ 입력이 la_dim 기준)
         self.la_head = nn.Linear(self.model_dim, self.la_dim)
 
         # VQ
@@ -270,7 +317,7 @@ class SpaceTimeIDM(BaseModel):
         B, T, *_ = observations.shape
         observations_hwcn = observations.permute(0, 1, 3, 4, 2)  # B,T,H,W,C
 
-        patches = patchify(observations_hwcn, self.cfg.patch_size)         # [B,T,N,patch_dim]
+        patches = patchify(observations_hwcn, self.cfg.patch_size)          # [B,T,N,patch_dim]
         patches_embed = self.activation(self.input_embed(patches))          # [B,T,N,model_dim]
 
         N_aug = self.num_patches
@@ -297,21 +344,33 @@ class SpaceTimeIDM(BaseModel):
 
         la_z = z.mean(dim=2)                 # [B,T,model_dim]
         la_z = self.ln_pre_head(la_z)        # img_embed로 쓸 값
-        la_cont = self.la_head(la_z)         # [B,T,la_dim]
 
-        vq_loss = torch.tensor(0.0, device=observations.device)
+        # (4) IDM pair action (continuous)
+        pad_la = torch.zeros(B, 1, self.la_dim, device=observations.device)
+        if T > 1:
+            e_prev = la_z[:, :-1]                                  # [B,T-1,E]
+            e_curr = la_z[:, 1:]                                   # [B,T-1,E]
+            pair = torch.cat([e_prev, e_curr], dim=-1)             # [B,T-1,2E]
+            a_pred = self.la_pair_head(pair)                       # [B,T-1,la_dim]
+            la_final = torch.cat([pad_la, a_pred], dim=1)          # [B,T,la_dim]
+        else:
+            la_final = pad_la
+
+        # VQ 입력용 la_cont (기존 NSVQ 설계 유지)
+        la_cont = self.la_head(la_z)                                # [B,T,la_dim]
+
         vq_outputs, vq_metrics = {}, {}
 
-        pad_la = torch.zeros(B, 1, self.la_dim, device=observations.device)
-        la_final = torch.cat([pad_la, la_cont[:, 1:] - la_cont[:, :-1]], dim=1) if T > 1 else la_cont
+        # (3) vq_loss 실제 연결
+        vq_loss = torch.tensor(0.0, device=observations.device)
 
         if self.cfg.quantize_la and self.vq is not None and T > 1:
-            e_cur = la_cont[:, :-1]
-            e_nxt = la_cont[:, 1:]
+            e_cur = la_cont[:, :-1]                                 # [B,T-1,la_dim]
+            e_nxt = la_cont[:, 1:]                                  # [B,T-1,la_dim]
             flat_cur = e_cur.reshape(-1, self.la_dim)
             flat_nxt = e_nxt.reshape(-1, self.la_dim)
 
-            quant_flat, perplexity, _, idx_flat = self.vq(
+            quant_flat, perplexity, vq_aux, idx_flat = self.vq(
                 input_data_first=flat_cur,
                 input_data_last=flat_nxt,
                 codebook_training_only=False,
@@ -320,14 +379,22 @@ class SpaceTimeIDM(BaseModel):
             quant_delta = quant_flat.view(B, T - 1, self.la_dim)
             indices = idx_flat.view(B, T - 1)
 
+            # VQ 켜면 action은 quant_delta로 교체(기존 동작 유지)
             la_final = torch.cat([pad_la, quant_delta], dim=1)
 
             pad_idx = torch.zeros(B, 1, dtype=torch.long, device=observations.device)
             vq_outputs["indices"] = torch.cat([pad_idx, indices], dim=1)
             vq_metrics["perplexity"] = float(perplexity.item())
 
-        # ✅ world model 입력
-        vq_outputs["img_embed"] = la_z
+            # NSVQ가 loss/aux를 주면 vq_loss로 사용
+            if isinstance(vq_aux, torch.Tensor):
+                vq_loss = vq_aux.mean()
+            elif isinstance(vq_aux, (list, tuple)) and len(vq_aux) > 0 and isinstance(vq_aux[0], torch.Tensor):
+                vq_loss = torch.stack([x.mean() for x in vq_aux]).mean()
+
+        # (7) 큰 텐서를 output dict에 저장할 때는 detach해서 그래프 누수 방지
+        # WM 입력으로는 그대로 쓰되, 저장은 detach.
+        vq_outputs["img_embed"] = la_z.detach()
 
         return IDMOutput(
             la=la_final,
@@ -452,12 +519,13 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
                 la_dim=la_dim,
                 cfg=wm_cfg,
             )
-            log("World Model ENABLED (posterior/prior + KL)", "green")
+            log("World Model ENABLED (posterior/prior + KL + pred loss)", "green")
         else:
             self.world_model = None
             log("World Model DISABLED", "yellow")
 
         self.add_wm_kl_to_vq_loss = bool(getattr(cfg, "add_wm_kl_to_vq_loss", True))
+        self.add_wm_pred_to_vq_loss = bool(getattr(cfg, "add_wm_pred_to_vq_loss", True))
 
     def forward(
         self,
@@ -471,13 +539,14 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
 
         wm_cond = None
         wm_kl = observations.new_tensor(0.0)
+        wm_pred = observations.new_tensor(0.0)
 
         if self.use_wm and (self.world_model is not None):
             img_embed = idm_output.vq_outputs.get("img_embed", None)
             if img_embed is None:
                 raise RuntimeError("IDMOutput.vq_outputs['img_embed'] missing. IDM must store it.")
 
-            wm_cond, wm_kl, _dbg = self.world_model(
+            wm_cond, wm_kl, wm_pred, _dbg = self.world_model(
                 img_embed=img_embed,
                 la_delta=idm_output.la,
                 robot_state=None,   # ✅ robot_state 안 씀
@@ -485,16 +554,23 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
 
             if isinstance(idm_output.vq_metrics, dict):
                 idm_output.vq_metrics["wm_kl"] = float(wm_kl.detach().cpu())
+                idm_output.vq_metrics["wm_pred"] = float(wm_pred.detach().cpu())
 
+            # (2) WM loss들을 학습 loss에 포함
+            new_vq_loss = idm_output.vq_loss
             if self.add_wm_kl_to_vq_loss:
-                idm_output = IDMOutput(
-                    la=idm_output.la,
-                    quantized_la=idm_output.quantized_la,
-                    vq_loss=idm_output.vq_loss + wm_kl,
-                    vq_metrics=idm_output.vq_metrics,
-                    vq_outputs=idm_output.vq_outputs,
-                    encoder_out=idm_output.encoder_out,
-                )
+                new_vq_loss = new_vq_loss + wm_kl
+            if self.add_wm_pred_to_vq_loss:
+                new_vq_loss = new_vq_loss + wm_pred
+
+            idm_output = IDMOutput(
+                la=idm_output.la,
+                quantized_la=idm_output.quantized_la,
+                vq_loss=new_vq_loss,
+                vq_metrics=idm_output.vq_metrics,
+                vq_outputs=idm_output.vq_outputs,
+                encoder_out=idm_output.encoder_out,
+            )
 
         recon = self.fdm(
             observations=observations,
@@ -510,6 +586,8 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
             idm_output=idm_output,
         )
 
+    # rollout/visualize 함수들은 그대로 두되,
+    # IDM이 action을 pair-head로 생성하는 것으로 의미만 바뀜(인터페이스 동일).
     @torch.no_grad()
     def rollout_idm_fdm_closed_loop(
         self,
@@ -517,11 +595,6 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
         gt_states: torch.Tensor = None,
         max_steps: int | None = None,
     ):
-        """
-        ✅ [Fix #2/#3]
-        - (2) GT slice 오프바이원 수정: (t_prev, t_curr)와 입력 프레임이 일치하도록
-        - (3) 스케일 통일: rollout 내부는 [-1, 1]로 유지 (학습/비디오 eval과 일관)
-        """
         use_gt_image = True
         use_gt_action = False
 
@@ -531,15 +604,12 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
 
         recons: List[torch.Tensor] = []
 
-        # --- History Buffers for Transformer WM ---
         history_z = []
         history_a = []
 
         def _postprocess_frame(x: torch.Tensor) -> torch.Tensor:
-            # rollout 내부 스케일은 [-1, 1] 유지
             return x.clamp(-1, 1)
 
-        # Helper: IDM 결과에서 z 추출 (Posterior)
         def _encode_obs_to_z(idm_out):
             if self.world_model is None:
                 return None
@@ -557,8 +627,7 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
                 encoder_out=getattr(idm_out_full, "encoder_out", None),
             )
 
-        # --- 1. Warmup: predict frame 1 from frames (0,1) ---
-        pair0 = gt_seq[0:2].unsqueeze(0)          # (0,1)
+        pair0 = gt_seq[0:2].unsqueeze(0)
         ts0 = torch.tensor([[0, 1]], device=device)
 
         idm_out0 = self.idm(pair0, timesteps=ts0, states=None)
@@ -573,27 +642,23 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
             history_z.append(z0)
             history_a.append(la0)
 
-            curr_z_hist = z0[:, :-1]   # z_0
-            curr_a_hist = la0[:, 1:]   # a_1
+            curr_z_hist = z0[:, :-1]
+            curr_a_hist = la0[:, 1:]
 
-            deter0 = self.world_model.predict_next_deter(curr_z_hist, curr_a_hist)  # deter_1
-            wm_cond0 = self.world_model.get_cond(z0[:, -1:], deter0)               # use z_1
+            deter0 = self.world_model.predict_next_deter(curr_z_hist, curr_a_hist)
+            wm_cond0 = self.world_model.get_cond(z0[:, -1:], deter0)
 
         idm_step0 = _make_step_output(idm_out0, la0)
         recon0 = self.fdm(pair0, idm_step0, ts0, states=None, wm_cond=wm_cond0)
         recons.append(_postprocess_frame(recon0[0, -1]))
 
-        # --- 2. Loop: predict frame t from frames (t-1, t) when use_gt_image=True ---
         for t_curr in range(2, max_steps + 1):
             t_prev = t_curr - 1
             ts_pair = torch.tensor([[t_prev, t_curr]], device=device)
 
             if use_gt_image:
-                # ✅ [Fix #2] timesteps (t_prev,t_curr)에 맞게 (t_prev,t_curr) 프레임을 넣는다
                 pair_input = gt_seq[t_prev : t_curr + 1].unsqueeze(0)
             else:
-                # generated closed-loop: (t_prev-1, t_prev) -> next
-                # (여기서는 원래 코드 흐름 유지, 스케일만 [-1,1] 유지)
                 if len(recons) == 1:
                     prev_img = gt_seq[1]
                     curr_img = recons[-1]
@@ -602,36 +667,30 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
                     curr_img = recons[-1]
                 pair_input = torch.stack([prev_img, curr_img], dim=0).unsqueeze(0)
 
-            # IDM
             idm_out = self.idm(pair_input, timesteps=ts_pair, states=None)
             current_la = idm_out.la
 
-            # (optional) GT action override
             if use_gt_action:
-                # 여기서 GT action을 쓰는 경우가 있다면, la 인덱싱을 t_curr에 맞춰줘야 함
-                # 하지만 현재 코드에서는 use_gt_action=False 기본이므로 pass 유지
                 pass
 
-            # WM cond
             wm_cond = None
             if self.use_wm:
                 z_curr_pair = _encode_obs_to_z(idm_out)  # [1, 2, z]
-                z_t = z_curr_pair[:, -1:]               # z_{t_curr}
-                a_t = current_la[:, -1:]                # a_{t_curr}
+                z_t = z_curr_pair[:, -1:]
+                a_t = current_la[:, -1:]
 
                 history_z.append(z_t)
                 history_a.append(a_t)
 
-                full_z = torch.cat(history_z, dim=1)    # z_0 ... z_t
-                full_a = torch.cat(history_a, dim=1)    # a_0 ... a_t
+                full_z = torch.cat(history_z, dim=1)
+                full_a = torch.cat(history_a, dim=1)
 
-                inp_z = full_z[:, :-1]                  # z_0 ... z_{t-1}
-                inp_a = full_a[:, 1:]                   # a_1 ... a_t
+                inp_z = full_z[:, :-1]
+                inp_a = full_a[:, 1:]
 
-                deter_t = self.world_model.predict_next_deter(inp_z, inp_a)  # deter_t
+                deter_t = self.world_model.predict_next_deter(inp_z, inp_a)
                 wm_cond = self.world_model.get_cond(full_z[:, -1:], deter_t)
 
-            # FDM
             idm_step = _make_step_output(idm_out, current_la)
             recon_next = self.fdm(pair_input, idm_step, ts_pair, states=None, wm_cond=wm_cond)
 
@@ -645,19 +704,13 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
         gt_seq: torch.Tensor,
         context_len: int = 5,
     ):
-        """
-        ✅ [Fix #2/#3]
-        - (2) GT slice 오프바이원 수정: timesteps와 입력 프레임 정렬
-        - (3) 스케일 통일: 내부는 [-1,1] 유지 (비디오 eval과 동일)
-        """
         device = gt_seq.device
         T_total, C, H, W = gt_seq.shape
 
-        # Oracle Action Extraction
         gt_batch = gt_seq.unsqueeze(0)
         ts_full = torch.arange(T_total, device=device).unsqueeze(0)
         idm_out_full = self.idm(gt_batch, timesteps=ts_full, states=None)
-        gt_actions = idm_out_full.la  # [1, T, la_dim] (index t 는 transition (t-1)->t 로 쓰는 게 맞음)
+        gt_actions = idm_out_full.la
 
         recons: List[torch.Tensor] = []
         history_z = []
@@ -689,26 +742,22 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
                 encoder_out=getattr(idm_out_full, "encoder_out", None),
             )
 
-        # --- (A) Warmup: (0,1) -> predict frame 1 ---
         pair0 = gt_seq[0:2].unsqueeze(0)
         ts0 = torch.tensor([[0, 1]], device=device)
         idm_out0 = self.idm(pair0, timesteps=ts0, states=None)
 
-        # ✅ GT action 정렬: frame 1을 만들려면 la[1]이 필요.
         la0 = torch.zeros_like(idm_out0.la)
         la0[:, 1:2] = gt_actions[:, 1:2]
 
         wm_cond0 = None
         if self.use_wm:
-            z0 = _get_posterior_z(idm_out0)  # [1,2,z]
-            history_z.append(z0[:, 0:1])     # z_0
-            history_a.append(la0[:, 0:1])    # a_0 (pad)
+            z0 = _get_posterior_z(idm_out0)
+            history_z.append(z0[:, 0:1])
+            history_a.append(la0[:, 0:1])
 
-            # deter_1을 만들기 위한 입력: z_0, a_1
             deter0 = self.world_model.predict_next_deter(z0[:, 0:1], la0[:, 1:2])
             wm_cond0 = self.world_model.get_cond(z0[:, 1:2], deter0)
 
-            # history 업데이트: z_1, a_1
             history_z.append(z0[:, 1:2])
             history_a.append(la0[:, 1:2])
 
@@ -716,18 +765,14 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
         recon0 = self.fdm(pair0, idm_step0, ts0, states=None, wm_cond=wm_cond0)
         recons.append(_postprocess_frame(recon0[0, -1]))
 
-        # --- (B) Step-by-step dreaming: predict frame t_curr using (t_prev,t_curr) in context, 이후 generated ---
         for t_curr in range(2, T_total):
             t_prev = t_curr - 1
             ts_pair = torch.tensor([[t_prev, t_curr]], device=device)
             is_context = t_curr < context_len
 
-            # Input frames
             if is_context:
-                # ✅ [Fix #2] context는 GT (t_prev,t_curr)로 맞춘다
                 pair_input = gt_seq[t_prev : t_curr + 1].unsqueeze(0)
             else:
-                # dreaming: 이전 생성 프레임 사용 (t_prev-1, t_prev 근사)
                 if len(recons) == 1:
                     prev_gen = gt_seq[1]
                     curr_gen = recons[-1]
@@ -736,22 +781,18 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
                     curr_gen = recons[-1]
                 pair_input = torch.stack([prev_gen, curr_gen], dim=0).unsqueeze(0)
 
-            # IDM (patch feature용)
             idm_out = self.idm(pair_input, timesteps=ts_pair, states=None)
 
-            # ✅ GT action 정렬: frame t_curr을 만들려면 la[t_curr]을 넣어야 함
             la_override = torch.zeros_like(idm_out.la)
             la_override[:, 1:2] = gt_actions[:, t_curr : t_curr + 1]
 
             wm_cond = None
             if self.use_wm:
-                a_t = la_override[:, 1:2]  # a_{t_curr}
+                a_t = la_override[:, 1:2]
 
-                # history의 full_z/full_a 구성
-                full_z = torch.cat(history_z, dim=1)  # z_0 ... z_{t_prev} (이미 쌓여있음)
-                full_a = torch.cat(history_a, dim=1)  # a_0 ... a_{t_prev}
+                full_z = torch.cat(history_z, dim=1)
+                full_a = torch.cat(history_a, dim=1)
 
-                # deter_{t_curr}를 위해: z_{0:t_prev} 와 a_{1:t_curr}
                 inp_z = full_z
                 inp_a = torch.cat([full_a[:, 1:], a_t], dim=1)
 
@@ -763,13 +804,11 @@ class SpaceTimeCLAM_TSSM(TransformerCLAM):
                 else:
                     z_t = _sample_prior_z(deter_t)
 
-                # history에 z_t, a_t 추가
                 history_z.append(z_t)
                 history_a.append(a_t)
 
                 wm_cond = self.world_model.get_cond(z_t, deter_t)
 
-            # FDM prediction
             idm_step = _make_step_output(idm_out, la_override)
             recon_next = self.fdm(pair_input, idm_step, ts_pair, states=None, wm_cond=wm_cond)
 
