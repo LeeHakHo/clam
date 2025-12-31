@@ -78,17 +78,14 @@ class CLAMTrainer(OfflineTrainer):
             )
 
         # ---------------------------------------------------------------------
-        # [Fix] Video Evaluation Dataset Setup
+        # Video Evaluation Dataset Setup
         # ---------------------------------------------------------------------
-        # 1) eval group 경로
         eval_ds_path = getattr(self.cfg.env, "eval_dataset_name", self.cfg.env.dataset_name)
 
-        # 2) eval dataset 리스트(실제 이름들)
         eval_ds_list = getattr(self.cfg.env, "eval_datasets", None)
         if eval_ds_list is None or len(eval_ds_list) == 0:
             eval_ds_list = getattr(self.cfg.env, "datasets", [])
 
-        # 3) 비디오용으로 “실제 존재하는” 첫 번째 eval dataset 선택
         self.video_ds_name = eval_ds_list[0]
 
         log(f"[VideoEval] Path: '{eval_ds_path}', Target Dataset: '{self.video_ds_name}'", "blue")
@@ -174,7 +171,6 @@ class CLAMTrainer(OfflineTrainer):
         return clam_optimizer, clam_scheduler
 
     def compute_action_decoder_loss(self, batch, train: bool = True):
-        # (기존 코드와 동일하여 생략 가능하지만 전체 코드를 위해 포함)
         obs = batch.observations
         k_step = self.cfg.model.fdm.k_step_pred
         if k_step > 1:
@@ -216,47 +212,53 @@ class CLAMTrainer(OfflineTrainer):
         action_decoder_loss = self.action_decoder_loss_fn(action_pred, gt_actions).mean()
         return action_decoder_loss, {"action_decoder_loss": action_decoder_loss.item()}
 
+    def anneal_temp(self, global_step):
+
+        temp_start = self.cfg.model.arch.world_model.temp_start
+        temp_end = self.cfg.model.arch.world_model.temp_end
+        decay_steps = self.cfg.model.arch.world_model.temp_decay_steps
+        temp = temp_start - (temp_start - temp_end) * (global_step - self.cfg.model.arch.prefill) / decay_steps
+
+        temp = max(temp, temp_end)
+
+        return temp
+
     def compute_loss(self, batch, train: bool = True):
-        k_step = self.cfg.model.fdm.k_step_pred
-        if k_step > 1:
-            def splice(x, start, end):
-                return x[:, start:end] if x is not None else x
-            total_loss = 0.0
-            obs_recons = []
-            metrics = collections.defaultdict(float)
-            for step in range(k_step):
-                end = self.cfg.model.context_len + 1 + step
-                batch_splice = dict(map(lambda kv: (kv[0], splice(kv[1], start=step, end=end)), batch.__dict__.items()))
-                batch_splice = Batch(**batch_splice)
-                if len(obs_recons) > 0:
-                    new_observations = batch_splice.observations.clone()
-                    new_observations[:, -2] = obs_recons[-1]
-                    batch_splice.observations = new_observations
-                step_metrics, obs_recon, step_loss = self.compute_step_loss(batch_splice, train=train)
-                for k, v in step_metrics.items():
-                    metrics[k] += v
-                obs_recons.append(obs_recon)
-                total_loss += step_loss
-            obs_recons = torch.stack(obs_recons, dim=-1)
-            metrics = {k: v / k_step for k, v in metrics.items()}
+
+        if hasattr(batch, 'done') and batch.done is not None:
+            done = batch.done
         else:
-            metrics, obs_recon, total_loss = self.compute_step_loss(batch, train=train)
+            done = torch.zeros(batch.actions.shape[:2], device=self.device)
+
+        if hasattr(batch, 'reward') and batch.reward is not None:
+            reward = batch.reward
+        else:
+            reward = torch.zeros(batch.actions.shape[:2], device=self.device)
+
+        traj_dict = {
+            'observations': batch.observations,
+            'image': batch.observations,
+            'timestep': batch.timestep,
+            'reward': reward,
+            'done': done,
+            'action': batch.actions
+        }
+        global_step = self.train_step
+        temp = self.anneal_temp(global_step)
+        model_loss, model_logs, prior_state, post_state= self.model.world_model_loss(global_step, traj_dict, temp)
+            
+        metrics = model_logs
+        total_loss = model_loss
         return metrics, total_loss
 
+
     def compute_step_loss(self, batch, train: bool = True):
-        if self.use_transformer:
-            clam_output = self.model(
-                batch.observations, timesteps=batch.timestep, states=batch.states
-            )
-            obs_gt = batch.observations[:, 1:]
-            cheat_pred = batch.observations[:, :-1]
-            cheat_loss = self.loss_fn(cheat_pred, obs_gt).mean()
-        else:
-            clam_output = self.model(batch.observations)
-            if not self.cfg.model.fdm.predict_target_embedding:
-                obs_gt = batch.observations[:, self.cfg.model.context_len :].squeeze()
-            cheat_pred = batch.observations[:, self.cfg.model.context_len - 1 : -1].squeeze()
-            cheat_loss = self.loss_fn(cheat_pred, obs_gt).mean()
+        clam_output = self.model(
+            batch.observations, timesteps=batch.timestep, states=batch.states
+        )
+        obs_gt = batch.observations[:, 1:]
+        cheat_pred = batch.observations[:, :-1]
+        cheat_loss = self.loss_fn(cheat_pred, obs_gt).mean()
 
         obs_recon = clam_output.reconstructed_obs
         la = clam_output.la
@@ -484,11 +486,6 @@ class CLAMTrainer(OfflineTrainer):
 
     @torch.no_grad()
     def target_vis(self, sample_dataloader):
-        """
-        ✅ [Fix #3]
-        - pred/gt를 [-1,1]로 보고 diff 계산
-        - 시각화는 (x+1)/2 로 [0,1] 변환해서 보여줌
-        """
         batch = self._take_one_batch(sample_dataloader)
         b = 0
         if self.use_transformer:

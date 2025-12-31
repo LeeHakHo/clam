@@ -9,6 +9,9 @@ fdm:
   seq_len: ${data.seq_len}
   concatenate_gripper_state: ${model.concatenate_gripper_state}
 
+kl_loss_weight: 0.1
+distributional_la: True
+
 defaults:
   - clam
   - vq: vqNSVQ

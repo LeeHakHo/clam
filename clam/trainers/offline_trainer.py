@@ -20,11 +20,9 @@ class OfflineTrainer(BaseTrainer):
         super().__init__(cfg)
         self.train_step = 0
 
-        # ✅ eval iterator 반드시 초기화 (repeat로 StopIteration 방지)
         self._eval_iter = self.eval_dataloader.repeat().as_numpy_iterator()
 
     def train(self):
-        # ✅ accelerate면 main process만 eval 돌리기 (중복/충돌 방지)
         if (not self.cfg.skip_first_eval) and (
             (not self.cfg.accelerate.use) or self.accelerator.is_main_process
         ):
@@ -109,8 +107,6 @@ class OfflineTrainer(BaseTrainer):
                 metrics["action_decoder_lr"] = self.action_decoder_scheduler.get_last_lr()[0]
 
             self.log_to_wandb(metrics, prefix="train/")
-
-            # ✅ eval은 main process만
             if (not self.cfg.accelerate.use) or self.accelerator.is_main_process:
                 if ((self.train_step + 1) % self.eval_every) == 0:
                     self.eval(step=self.train_step + 1)
@@ -130,7 +126,6 @@ class OfflineTrainer(BaseTrainer):
             self.wandb_run.finish()
 
     def eval(self, step: int):
-        # ✅ accelerate면 main process만 eval
         if self.cfg.accelerate.use and (not self.accelerator.is_main_process):
             return {}
 
@@ -143,7 +138,6 @@ class OfflineTrainer(BaseTrainer):
         eval_time = time.time()
         eval_metrics = collections.defaultdict(list)
 
-        # ✅ 혹시라도 iterator가 None/없으면 복구
         if not hasattr(self, "_eval_iter") or self._eval_iter is None:
             self._eval_iter = self.eval_dataloader.repeat().as_numpy_iterator()
 
