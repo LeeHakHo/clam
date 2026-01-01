@@ -16,7 +16,7 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /scratch1/hyeonhoo/miniconda3/envs/my_env
 cd clam
-export WANDB_API_KEY="61a1a21df93bbb2da31d41abc3400294b59ba6eb"
+export WANDB_API_KEY=
 
 echo "dreamer_rollout/ vq x / context_len 32"
 export PYTHONPATH=$PWD:$PYTHONPATH
