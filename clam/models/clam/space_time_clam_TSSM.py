@@ -25,62 +25,59 @@ import pdb
 class ActionDecoderV3Full(nn.Module):
     def __init__(
         self, 
-        input_size,    # s_t 차원 (h_t + z_t)
-        action_size,   # env.action_size
-        layers=5,      #
-        units=1024,    #
-        act='silu',    #
-        norm='rms',    #
-        unimix=0.01,   #
-        outscale=1.0   #
+        input_size,    # s_t = (z_t, h_t)
+        action_size,  
+        layers=5,      
+        units=1024,    
+        act='silu',    
+        norm='rms',    
+        unimix=0.01,   
+        outscale=1.0   
     ):
         super().__init__()
         self._unimix = unimix
         self._action_size = action_size
 
-        # 1. MLP 구조 (JAX의 self.mlp 부분)
+        # MLP
         model = []
         for i in range(layers):
             in_dim = input_size if i == 0 else units
-            # Dreamer V3 공식 구현 스타일: Linear (bias=True) + RMSNorm
+            # Linear (bias=True) + RMSNorm
             line = nn.Linear(in_dim, units, bias=True)
             
-            # 초기화 로직 이식: trunc_normal
+            # runc_normal
             nn.init.trunc_normal_(line.weight, std=0.02)
             if line.bias is not None:
                 nn.init.zeros_(line.bias)
                 
             model.append(line)
             
-            # RMSNorm (JAX의 'rms' 매칭) 
+            # RMSNorm
             model.append(nn.RMSNorm(units))
             
-            # SiLU 활성화 (JAX의 'silu' 매칭) 
+            # SiLU
             model.append(nn.SiLU())
         
         self.mlp = nn.Sequential(*model)
 
-        # 2. Head 출력층 (JAX의 self.head.onehot 부분)
+        # 2. Head output
         self.out = nn.Linear(units, action_size, bias=True)
         
-        # 출력층 초기화 (outscale 적용)
+
         nn.init.trunc_normal_(self.out.weight, std=0.02 * outscale)
         if self.out.bias is not None:
             nn.init.zeros_(self.out.bias)
 
     def forward(self, features):
         """
-        features: RSSM의 post_state로부터 얻은 {h_t, z_t} 결합체 [cite: 204]
+        features: {h_t, z_t}
         shape: [Batch, Time, D]
         """
-        # 1. MLP 통과
         x = self.mlp(features)
-        
-        # 2. 로짓 계산
+
         logits = self.out(x)
         
-        # 3. Unimix 적용 (Categorical 분포 안정화) [cite: 621, 678]
-        # 1%의 균등 분포를 섞어 log(0) 발생 방지
+        # Unimix
         probs = torch.softmax(logits, dim=-1)
         if self._unimix > 0:
             probs = (1.0 - self._unimix) * probs + self._unimix / self._action_size
@@ -145,9 +142,7 @@ class SpaceTimeCLAM_TSSM(nn.Module):
             none=torch.nn.Identity(),
         )[cfg.rl.r_transform]
 
-        #va_encoder
         shapes = {'image': tuple(input_dim)}
-        #self.va_encoder = va_net.VANet(shapes, **cfg.vanet)
 
 
         self.pol = ActionDecoderV3Full(dense_input_size, self.action_size)
@@ -447,15 +442,12 @@ class SpaceTimeCLAM_TSSM(nn.Module):
                 actions[:, :t]
             )
             
-            # 다음 스텝의 stoch 샘플링 (Prior에서 가져옴)
             next_stoch = prior_step['stoch'][:, -1:] # [B, 1, N, C]
             all_stoch.append(next_stoch)
 
         # decoding
         full_stoch_seq = torch.cat(all_stoch, dim=1) # [B, T, N, C]
         
-        # deter/o_t는 Transformer의 마지막 시점 출력을 사용해야 하므로 
-        # 전체 stoch sequence를 다시 cell에 넣어 feature를 뽑습니다.
         act_sto_emb = self.world_model.dynamic.encode_s(full_stoch_seq[:, :-1], actions[:, 1:])
         s_t_reshape = act_sto_emb.reshape(B, T-1, -1, 1, 1)
         o_t = self.world_model.dynamic.cell(s_t_reshape, None) 

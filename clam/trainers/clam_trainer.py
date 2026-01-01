@@ -353,8 +353,6 @@ class CLAMTrainer(OfflineTrainer):
         
         log(f"[Debug] batch.observations.shape = {batch.observations.shape}", "yellow")
 
-        # 모델의 forward를 통해 재구성 이미지 획득
-        # TSSM의 forward는 내부적으로 RSSM post_state를 거쳐 recon_obs를 뱉음
         temp = self.anneal_temp(self.train_step)
         out = self.model(
             observations=batch.observations, 
@@ -364,7 +362,6 @@ class CLAMTrainer(OfflineTrainer):
             training=False
         )
         
-        # 스케일 복원: [-0.5, 0.5] -> [0, 1] (TSSM 내부에서 이미 /255 및 -0.5 처리함)
         pred = (out['recon_obs'][0] + 0.5).clamp(0, 1) # [T-1, C, H, W]
         gt = batch.observations[0, 1:].clone().float()
         if gt.max() > 1.0: gt /= 255.
@@ -427,7 +424,6 @@ class CLAMTrainer(OfflineTrainer):
             
             p_t, g_t = pred[t], gt[t]
             
-            # 상상(Dreaming) 구간 표시용 테두리 (빨간색)
             if context_len is not None and (t + 1) >= context_len:
                 p_t = p_t.clone()
                 p_t[0, :2, :] = 1.0; p_t[1:, :2, :] = 0.0 # Red border top
@@ -460,25 +456,21 @@ class CLAMTrainer(OfflineTrainer):
             else:
                 gt = raw_gt.clamp(0, 1)
 
-            log(f"DEBUG: Video T dim is {dec.shape[1]}") # 8 이하라면 1초 내외로 나옵니다.
+            log(f"DEBUG: Video T dim is {dec.shape[1]}")
                         
             num_samples = min(dec.shape[0], 4)
             frames = []
 
             for t in range(dec.shape[1]):
-                # 2. GT(위)와 DEC(아래)를 세로로 결합
-                # gt[0,t], gt[1,t]... 순서대로 가로로 놓기 위해 nrow 설정
                 top_row = torchvision.utils.make_grid(gt[:num_samples, t], nrow=num_samples)
                 bottom_row = torchvision.utils.make_grid(dec[:num_samples, t], nrow=num_samples)
                 
-                # 위아래로 합침 [C, H*2, W*num_samples]
                 combined_frame = torch.cat([top_row, bottom_row], dim=1)
                 
-                # 3. numpy 변환 (정확한 float -> uint8 매핑)
                 img = (combined_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 frames.append(img)
             
-            # WandB 비디오 로깅
+            #wandb logging
             video_array = np.stack(frames) # [T, H, W, C]
             eval_media["train/reconstruction_comparison"] = wandb.Video(
                 video_array.transpose(0, 3, 1, 2), fps=8, format="mp4"
