@@ -152,18 +152,6 @@ class SpaceTimeCLAM_TSSM(nn.Module):
 
         self.pol = ActionDecoderV3Full(dense_input_size, self.action_size)
 
-    
-    def va_encode(self, data):
-        if self.va_encoder._va_method == 'flow':
-            va_action_state = self.va_encoder(None,data['flow'][:,1:])
-        else:
-            va_action_state = self.va_encoder(data['image'][:,:-1],data['image'][:,1:])
-        if self.va_encoder.type == 'mix':
-            va_action =  torch.cat([va_action_state['deter'],va_action_state['stoch']],-1)
-        else:
-            va_action = va_action_state[self.va_encoder.type]
-        return va_action_state, self.va_encoder.append_action(va_action, ahead=True)
-
     def forward(self, observations, timesteps: torch.Tensor, temp, state=None, gt_action=None, done=None, training=True, context_len=49):
         B, T, C, H, W = observations.shape
         device = observations.device
@@ -176,30 +164,46 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         #action padding for first step
         z_actions = torch.zeros(B, T, self.action_size, device=device)
 
+
+        action_logits = []
+        deter_list = []
         for t in range(1, T):
             prev_stoch = post_state['stoch'][:, :t]
 
-            if gt_action is not None:
-                current_action_input = gt_action[:, :t]
-            else:
-                current_action_input = z_actions[:, :t]
+            current_action_input = gt_action[:, :t] if gt_action is not None else z_actions[:, :t]
 
             #h_t
             prior_step = self.world_model.dynamic.infer_prior_stoch(
                 prev_stoch, temp, actions=current_action_input
             )
 
-            deter_t = prior_step['deter'][:, -1] # (h'_t|s_t-1, z_t-1) - predicted
-            deter_t = deter_t.squeeze(1)
+            deter_list.append(prior_step['deter'][:, -1:])
 
-            stoch_t = post_state['stoch'][:, t].reshape(B, -1) # (h_t| o_t, h_t)
 
-            h_t = torch.cat([deter_t, stoch_t], dim=-1)
+            deter_t = prior_step['deter'][:, -1] # [B, D]
+            stoch_t = post_state['stoch'][:, t].reshape(B, -1) # [B, N*C]
+            h_t = torch.cat([deter_t, stoch_t], dim=-1) 
+            
             z_action_dist = self.pol(h_t)
+            
+            action_logits.append(z_action_dist.logits.unsqueeze(1))
+            
             z_action = z_action_dist.sample() if training else z_action_dist.mode
-
+            
             if t < T - 1:   
                 z_actions[:, t] = z_action
+
+        action_state = torch.cat(action_logits, dim=1)
+        all_deter = torch.cat(deter_list, dim=1)
+
+
+        post_state_aligned = {
+            'stoch': post_state['stoch'][:, 1:],  # [B, T-1, N, C]
+            'deter': all_deter          # [B, T-1, D]
+        }
+        
+        feat = self.world_model.dynamic.get_feature(post_state_aligned)
+        recon_obs = self.world_model.img_dec(feat).mean # [B, T-1, C, H, W]
 
         post_state['deter'] = prior_step['deter']
         post_state['o_t'] = prior_step['o_t']
@@ -207,8 +211,9 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         return {
             'prior_state': prior_step, # end point
             'post_state': post_state,
-            'action_state': z_action_dist,
-            'pred_action': z_actions
+            'action_state': action_state,
+            'pred_action': z_actions,
+            'recon_obs': recon_obs
         }
 
 
@@ -419,269 +424,53 @@ class SpaceTimeCLAM_TSSM(nn.Module):
 
         return action, state
 
-    @torch.no_grad()
-    def rollout_idm_fdm_closed_loop(
-        self,
-        gt_seq: torch.Tensor,
-        gt_states: torch.Tensor = None,
-        max_steps: int | None = None,
-    ):
-        """
-        ✅ [Fix #2/#3]
-        - (2) GT slice 오프바이원 수정: (t_prev, t_curr)와 입력 프레임이 일치하도록
-        - (3) 스케일 통일: rollout 내부는 [-1, 1]로 유지 (학습/비디오 eval과 일관)
-        """
-        use_gt_image = True
-        use_gt_action = False
-
-        device = gt_seq.device
-        T_total, C, H, W = gt_seq.shape
-        max_steps = min(max_steps, T_total - 1) if max_steps else T_total - 1
-
-        recons: List[torch.Tensor] = []
-
-        # --- History Buffers for Transformer WM ---
-        history_z = []
-        history_a = []
-
-        def _postprocess_frame(x: torch.Tensor) -> torch.Tensor:
-            # rollout 내부 스케일은 [-1, 1] 유지
-            return x.clamp(-1, 1)
-
-        # Helper: IDM 결과에서 z 추출 (Posterior)
-        def _encode_obs_to_z(idm_out):
-            if self.world_model is None:
-                return None
-            img_embed = idm_out.vq_outputs.get("img_embed", None)
-            z_post, _, _ = self.world_model.infer_posterior(img_embed)
-            return z_post
-
-        def _make_step_output(idm_out_full: IDMOutput, la_override: torch.Tensor) -> IDMOutput:
-            return IDMOutput(
-                la=la_override,
-                quantized_la=la_override,
-                vq_loss=getattr(idm_out_full, "vq_loss", gt_seq.new_tensor(0.0)),
-                vq_metrics=getattr(idm_out_full, "vq_metrics", {}),
-                vq_outputs=getattr(idm_out_full, "vq_outputs", {}),
-                encoder_out=getattr(idm_out_full, "encoder_out", None),
-            )
-
-        # --- 1. Warmup: predict frame 1 from frames (0,1) ---
-        pair0 = gt_seq[0:2].unsqueeze(0)          # (0,1)
-        ts0 = torch.tensor([[0, 1]], device=device)
-
-        idm_out0 = self.idm(pair0, timesteps=ts0, states=None)
-
-        la0 = idm_out0.la
-        if hasattr(self, "cfg") and getattr(self.cfg, "zero_action", False):
-            la0 = torch.zeros_like(la0)
-
-        wm_cond0 = None
-        if self.use_wm:
-            z0 = _encode_obs_to_z(idm_out0)  # [1, 2, z]
-            history_z.append(z0)
-            history_a.append(la0)
-
-            curr_z_hist = z0[:, :-1]   # z_0
-            curr_a_hist = la0[:, 1:]   # a_1
-
-            deter0 = self.world_model.predict_next_deter(curr_z_hist, curr_a_hist)  # deter_1
-            wm_cond0 = self.world_model.get_cond(z0[:, -1:], deter0)               # use z_1
-
-        idm_step0 = _make_step_output(idm_out0, la0)
-        recon0 = self.fdm(pair0, idm_step0, ts0, states=None, wm_cond=wm_cond0)
-        recons.append(_postprocess_frame(recon0[0, -1]))
-
-        # --- 2. Loop: predict frame t from frames (t-1, t) when use_gt_image=True ---
-        for t_curr in range(2, max_steps + 1):
-            t_prev = t_curr - 1
-            ts_pair = torch.tensor([[t_prev, t_curr]], device=device)
-
-            if use_gt_image:
-                # ✅ [Fix #2] timesteps (t_prev,t_curr)에 맞게 (t_prev,t_curr) 프레임을 넣는다
-                pair_input = gt_seq[t_prev : t_curr + 1].unsqueeze(0)
-            else:
-                # generated closed-loop: (t_prev-1, t_prev) -> next
-                # (여기서는 원래 코드 흐름 유지, 스케일만 [-1,1] 유지)
-                if len(recons) == 1:
-                    prev_img = gt_seq[1]
-                    curr_img = recons[-1]
-                else:
-                    prev_img = recons[-2]
-                    curr_img = recons[-1]
-                pair_input = torch.stack([prev_img, curr_img], dim=0).unsqueeze(0)
-
-            # IDM
-            idm_out = self.idm(pair_input, timesteps=ts_pair, states=None)
-            current_la = idm_out.la
-
-            # (optional) GT action override
-            if use_gt_action:
-                # 여기서 GT action을 쓰는 경우가 있다면, la 인덱싱을 t_curr에 맞춰줘야 함
-                # 하지만 현재 코드에서는 use_gt_action=False 기본이므로 pass 유지
-                pass
-
-            # WM cond
-            wm_cond = None
-            if self.use_wm:
-                z_curr_pair = _encode_obs_to_z(idm_out)  # [1, 2, z]
-                z_t = z_curr_pair[:, -1:]               # z_{t_curr}
-                a_t = current_la[:, -1:]                # a_{t_curr}
-
-                history_z.append(z_t)
-                history_a.append(a_t)
-
-                full_z = torch.cat(history_z, dim=1)    # z_0 ... z_t
-                full_a = torch.cat(history_a, dim=1)    # a_0 ... a_t
-
-                inp_z = full_z[:, :-1]                  # z_0 ... z_{t-1}
-                inp_a = full_a[:, 1:]                   # a_1 ... a_t
-
-                deter_t = self.world_model.predict_next_deter(inp_z, inp_a)  # deter_t
-                wm_cond = self.world_model.get_cond(full_z[:, -1:], deter_t)
-
-            # FDM
-            idm_step = _make_step_output(idm_out, current_la)
-            recon_next = self.fdm(pair_input, idm_step, ts_pair, states=None, wm_cond=wm_cond)
-
-            recons.append(_postprocess_frame(recon_next[0, -1]))
-
-        return torch.stack(recons, dim=0) if recons else torch.empty((0, C, H, W), device=device)
 
     @torch.no_grad()
-    def visualize_dreamer_style_rollout(
-        self,
-        gt_seq: torch.Tensor,
-        context_len: int = 5,
-    ):
-        """
-        ✅ [Fix #2/#3]
-        - (2) GT slice 오프바이원 수정: timesteps와 입력 프레임 정렬
-        - (3) 스케일 통일: 내부는 [-1,1] 유지 (비디오 eval과 동일)
-        """
-        device = gt_seq.device
-        T_total, C, H, W = gt_seq.shape
-
-        # Oracle Action Extraction
-        gt_batch = gt_seq.unsqueeze(0)
-        ts_full = torch.arange(T_total, device=device).unsqueeze(0)
-        idm_out_full = self.idm(gt_batch, timesteps=ts_full, states=None)
-        gt_actions = idm_out_full.la  # [1, T, la_dim] (index t 는 transition (t-1)->t 로 쓰는 게 맞음)
-
-        recons: List[torch.Tensor] = []
-        history_z = []
-        history_a = []
-
-        def _postprocess_frame(x: torch.Tensor) -> torch.Tensor:
-            return x.clamp(-1, 1)
-
-        def _get_posterior_z(idm_out):
-            if self.world_model is None:
-                return None
-            img_embed = idm_out.vq_outputs.get("img_embed", None)
-            z_post, _, _ = self.world_model.infer_posterior(img_embed)
-            return z_post
-
-        def _sample_prior_z(deter):
-            prior_mu, prior_logstd = self.world_model.infer_prior(deter)
-            eps = torch.randn_like(prior_mu)
-            z_prior = prior_mu + torch.exp(prior_logstd) * eps
-            return z_prior
-
-        def _make_step_output(idm_out_full, la_override):
-            return IDMOutput(
-                la=la_override,
-                quantized_la=la_override,
-                vq_loss=torch.tensor(0.0, device=device),
-                vq_metrics={},
-                vq_outputs=getattr(idm_out_full, "vq_outputs", {}),
-                encoder_out=getattr(idm_out_full, "encoder_out", None),
+    def visualize_diffusion_style_rollout(self, observations, actions, temp, context_len=5):
+        B, T, C, H, W = observations.shape
+        device = observations.device
+        
+        # 1. Image Encoding
+        obs_emb = self.world_model.dynamic.img_enc(observations / 255. - 0.5) # [B, T, D]
+        
+        # 2. Filtering 
+        post_state = self.world_model.dynamic.infer_post_stoch(obs_emb[:, :context_len], temp)
+        
+        current_stoch = post_state['stoch'] # [B, context_len, N, C]
+        all_stoch = [current_stoch]
+        
+        # 3. Dreaming (Open-loop Prediction)
+        for t in range(context_len, T):
+            prior_step = self.world_model.dynamic.infer_prior_stoch(
+                torch.cat(all_stoch, dim=1), 
+                temp, 
+                actions[:, :t]
             )
+            
+            # 다음 스텝의 stoch 샘플링 (Prior에서 가져옴)
+            next_stoch = prior_step['stoch'][:, -1:] # [B, 1, N, C]
+            all_stoch.append(next_stoch)
 
-        # --- (A) Warmup: (0,1) -> predict frame 1 ---
-        pair0 = gt_seq[0:2].unsqueeze(0)
-        ts0 = torch.tensor([[0, 1]], device=device)
-        idm_out0 = self.idm(pair0, timesteps=ts0, states=None)
-
-        # ✅ GT action 정렬: frame 1을 만들려면 la[1]이 필요.
-        la0 = torch.zeros_like(idm_out0.la)
-        la0[:, 1:2] = gt_actions[:, 1:2]
-
-        wm_cond0 = None
-        if self.use_wm:
-            z0 = _get_posterior_z(idm_out0)  # [1,2,z]
-            history_z.append(z0[:, 0:1])     # z_0
-            history_a.append(la0[:, 0:1])    # a_0 (pad)
-
-            # deter_1을 만들기 위한 입력: z_0, a_1
-            deter0 = self.world_model.predict_next_deter(z0[:, 0:1], la0[:, 1:2])
-            wm_cond0 = self.world_model.get_cond(z0[:, 1:2], deter0)
-
-            # history 업데이트: z_1, a_1
-            history_z.append(z0[:, 1:2])
-            history_a.append(la0[:, 1:2])
-
-        idm_step0 = _make_step_output(idm_out0, la0)
-        recon0 = self.fdm(pair0, idm_step0, ts0, states=None, wm_cond=wm_cond0)
-        recons.append(_postprocess_frame(recon0[0, -1]))
-
-        # --- (B) Step-by-step dreaming: predict frame t_curr using (t_prev,t_curr) in context, 이후 generated ---
-        for t_curr in range(2, T_total):
-            t_prev = t_curr - 1
-            ts_pair = torch.tensor([[t_prev, t_curr]], device=device)
-            is_context = t_curr < context_len
-
-            # Input frames
-            if is_context:
-                # ✅ [Fix #2] context는 GT (t_prev,t_curr)로 맞춘다
-                pair_input = gt_seq[t_prev : t_curr + 1].unsqueeze(0)
-            else:
-                # dreaming: 이전 생성 프레임 사용 (t_prev-1, t_prev 근사)
-                if len(recons) == 1:
-                    prev_gen = gt_seq[1]
-                    curr_gen = recons[-1]
-                else:
-                    prev_gen = recons[-2]
-                    curr_gen = recons[-1]
-                pair_input = torch.stack([prev_gen, curr_gen], dim=0).unsqueeze(0)
-
-            # IDM (patch feature용)
-            idm_out = self.idm(pair_input, timesteps=ts_pair, states=None)
-
-            # ✅ GT action 정렬: frame t_curr을 만들려면 la[t_curr]을 넣어야 함
-            la_override = torch.zeros_like(idm_out.la)
-            la_override[:, 1:2] = gt_actions[:, t_curr : t_curr + 1]
-
-            wm_cond = None
-            if self.use_wm:
-                a_t = la_override[:, 1:2]  # a_{t_curr}
-
-                # history의 full_z/full_a 구성
-                full_z = torch.cat(history_z, dim=1)  # z_0 ... z_{t_prev} (이미 쌓여있음)
-                full_a = torch.cat(history_a, dim=1)  # a_0 ... a_{t_prev}
-
-                # deter_{t_curr}를 위해: z_{0:t_prev} 와 a_{1:t_curr}
-                inp_z = full_z
-                inp_a = torch.cat([full_a[:, 1:], a_t], dim=1)
-
-                deter_t = self.world_model.predict_next_deter(inp_z, inp_a)
-
-                if is_context:
-                    z_curr_pair = _get_posterior_z(idm_out)
-                    z_t = z_curr_pair[:, -1:]
-                else:
-                    z_t = _sample_prior_z(deter_t)
-
-                # history에 z_t, a_t 추가
-                history_z.append(z_t)
-                history_a.append(a_t)
-
-                wm_cond = self.world_model.get_cond(z_t, deter_t)
-
-            # FDM prediction
-            idm_step = _make_step_output(idm_out, la_override)
-            recon_next = self.fdm(pair_input, idm_step, ts_pair, states=None, wm_cond=wm_cond)
-
-            recons.append(_postprocess_frame(recon_next[0, -1]))
-
-        return torch.stack(recons, dim=0)
+        # decoding
+        full_stoch_seq = torch.cat(all_stoch, dim=1) # [B, T, N, C]
+        
+        # deter/o_t는 Transformer의 마지막 시점 출력을 사용해야 하므로 
+        # 전체 stoch sequence를 다시 cell에 넣어 feature를 뽑습니다.
+        act_sto_emb = self.world_model.dynamic.encode_s(full_stoch_seq[:, :-1], actions[:, 1:])
+        s_t_reshape = act_sto_emb.reshape(B, T-1, -1, 1, 1)
+        o_t = self.world_model.dynamic.cell(s_t_reshape, None) 
+        o_t = o_t.reshape(B, T-1, self.world_model.dynamic.n_layers, -1)
+        
+        deter = o_t.reshape(B, T-1, -1) if self.world_model.dynamic.deter_type == 'concat_o' else o_t[:, :, -1]
+        
+        visualize_state = {
+            'stoch': full_stoch_seq[:, 1:], # [B, T-1, N, C]
+            'deter': deter                   # [B, T-1, D]
+        }
+        
+        feat = self.world_model.dynamic.get_feature(visualize_state)
+        
+        recon_video_dist = self.world_model.img_dec(feat)
+        recon_video = recon_video_dist.mean # [B, T-1, C, H, W]
+        
+        return {'pred_video': recon_video[0]} # return first batch

@@ -23,7 +23,7 @@ from clam.utils.data_utils import Batch
 from clam.utils.dataloader import get_dataloader
 from clam.utils.general_utils import to_device, to_numpy
 from clam.utils.logger import log
-
+from omegaconf import OmegaConf
 
 def get_labelled_dataloader(cfg):
     if cfg.data.labelled_data_type == "trajectory":
@@ -91,14 +91,25 @@ class CLAMTrainer(OfflineTrainer):
         log(f"[VideoEval] Path: '{eval_ds_path}', Target Dataset: '{self.video_ds_name}'", "blue")
 
         cfg2 = copy.deepcopy(self.cfg)
-        cfg2.data.shuffle = False
-        cfg2.data.batch_size = 1
-        cfg2.data.num_trajs = 10
-        cfg2.data.num_examples = -1
+        OmegaConf.set_struct(cfg2, False)
+        
+
+        dataset_max_len = getattr(self.cfg.env, "max_episode_steps", 32)
+        target_video_len = min(65, dataset_max_len)
+
+        cfg2.data.seq_len = target_video_len 
+        cfg2.data.batch_length = target_video_len
+
+        cfg2.data.seq_len = 31
+        cfg2.data.batch_length = 31
+        cfg2.model.context_len = 5  
+        cfg2.data.batch_size = 1   
+        cfg2.data.shuffle = False 
         cfg2.data.pad_dataset = True
 
         cfg2.env.dataset_name = eval_ds_path
         cfg2.env.datasets = [self.video_ds_name]
+
         try:
             ds_dict, *_ = get_dataloader(
                 cfg=cfg2,
@@ -246,8 +257,15 @@ class CLAMTrainer(OfflineTrainer):
         global_step = self.train_step
         temp = self.anneal_temp(global_step)
         model_loss, model_logs, prior_state, post_state= self.model.world_model_loss(global_step, traj_dict, temp)
-            
-        metrics = model_logs
+        
+        metrics = {k: v for k, v in model_logs.items() if not (isinstance(v, torch.Tensor) and v.numel() > 1)}
+
+        if 'dec_img' in model_logs:
+            self.last_vis_data = {
+            'dec_img': model_logs['dec_img'],
+            'gt_img': model_logs['gt_img']
+            }
+
         total_loss = model_loss
         return metrics, total_loss
 
@@ -318,296 +336,172 @@ class CLAMTrainer(OfflineTrainer):
             lut_np = mpl_cmaps.get_cmap(name)(np.linspace(0, 1, 256))[..., :3]
             self._cmap_lut = torch.tensor(lut_np, device=self.device, dtype=torch.float32)
 
-    # -------------------------------------------------------------------------
-    # [Fix] Corrected Video Generation Methods
-    # -------------------------------------------------------------------------
+
+    #---- Visualization---
+
     @torch.no_grad()
-    def make_episode_video(self, ds_name: str, save_path: str, fps: int = 8, max_steps: int | None = None):
+    def make_episode_video(self, ds_name: str, save_path: str, fps: int = 8, max_steps: int = 80):
         if self.video_seq_ds is None: return None
-        if max_steps is None: max_steps = 50
+        
+        it = self.video_seq_ds.as_numpy_iterator()
+        try:
+            batch_np = next(it)
+        except StopIteration: return None
 
-        seq_ds = self.video_seq_ds
-        it = seq_ds.as_numpy_iterator()
+        batch = to_device(batch_np, self.device)
+        batch = Batch(**batch) # [B, T, C, H, W]
+        
+        log(f"[Debug] batch.observations.shape = {batch.observations.shape}", "yellow")
 
-        frames = []
-        steps = 0
-        while steps < max_steps:
-            try:
-                batch_np = next(it)
-            except StopIteration:
-                break
+        # 모델의 forward를 통해 재구성 이미지 획득
+        # TSSM의 forward는 내부적으로 RSSM post_state를 거쳐 recon_obs를 뱉음
+        temp = self.anneal_temp(self.train_step)
+        out = self.model(
+            observations=batch.observations, 
+            timesteps=batch.timestep, 
+            gt_action=batch.actions,
+            temp=temp,
+            training=False
+        )
+        
+        # 스케일 복원: [-0.5, 0.5] -> [0, 1] (TSSM 내부에서 이미 /255 및 -0.5 처리함)
+        pred = (out['recon_obs'][0] + 0.5).clamp(0, 1) # [T-1, C, H, W]
+        gt = batch.observations[0, 1:].clone().float()
+        if gt.max() > 1.0: gt /= 255.
+        if gt.min() < 0: gt += 0.5
+        gt = gt.clamp(0, 1)
 
-            batch = to_device(batch_np, self.device)
-            batch = Batch(**batch)
-
-            if self.use_transformer:
-                out  = self.model(batch.observations, timesteps=batch.timestep, states=batch.states)
-                # [BUG FIX] Removed ':-1' slicing. Output is already T-1.
-                pred = out.reconstructed_obs[0]        # (T-1,C,H,W)
-                gt   = batch.observations[0, 1:]       # (T-1,C,H,W)
-            else:
-                out  = self.model(batch.observations)
-                pred = out.reconstructed_obs[0][None]
-                gt   = batch.observations[0, -1: ]
-
-            if self.cfg.env.n_frame_stack > 1:
-                C = pred.shape[-3]
-                pred = pred[:, C-3:C]; gt = gt[:, C-3:C]
-
-            # Diff visualization
-            diff_all = (pred - gt).abs().mean(dim=1, keepdim=True)
-            vmax = diff_all.max().clamp(min=1e-8)
-            self._ensure_cmap_lut("magma")
-            self._cmap_lut = self._cmap_lut.to(device=pred.device, dtype=pred.dtype)
-
-            Tprime = pred.shape[0]
-            for t in range(Tprime):
-                diff_t = diff_all[t] / vmax
-                diff_t = torch.nan_to_num(diff_t, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
-                idx = (diff_t.squeeze(0) * 255).floor().clamp(0, 255).long()
-                diff_rgb = self._cmap_lut[idx].permute(2,0,1).contiguous()
-                
-                pred_t = (pred[t].clamp(-1, 1) + 1) / 2
-                gt_t   = (gt[t].clamp(-1, 1) + 1) / 2
-
-                tile = torch.stack([diff_rgb, pred_t, gt_t], dim=0)
-                grid = torchvision.utils.make_grid(tile, nrow=3)
-                grid = einops.rearrange(grid, "c h w -> h w c")
-                img  = (torch.clamp(grid, 0, 1).cpu().numpy() * 255).astype(np.uint8)
-                frames.append(img)
-                steps += 1
-                if steps >= max_steps:
-                    break
-
-        if len(frames) == 0:
-            log(f"[make_episode_video] no frames produced for {ds_name}", "yellow")
-            return None
-
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with imageio.get_writer(save_path, format="mp4", fps=fps, codec="libx264", quality=8) as w:
-            for f in frames:
-                w.append_data(f)
-
-        self.log_to_wandb({f"videos/episode_{ds_name}": wandb.Video(save_path, fps=fps, format="mp4")})
-        log(f"[make_episode_video] saved: {save_path}", "green")
-        return save_path
+        frames = self._create_frames_from_tensors(pred, gt)
+        video_obj = self._save_video(frames, save_path, fps)
+        return video_obj
 
     @torch.no_grad()
-    def make_dreamer_rollout_video(self, ds_name: str, save_path: str, context_len: int = 5, fps: int = 8, max_steps: int = 50):
-        """
-        ✅ [Fix #3]
-        - model/gt 스케일을 [-1,1]로 가정하고,
-        시각화할 때만 (x+1)/2 로 [0,1] 변환
-        """
-        if not hasattr(self, "video_seq_ds") or self.video_seq_ds is None:
-            return None
-
-        seq_ds = self.video_seq_ds
-        it = seq_ds.as_numpy_iterator()
-
-        full_gt_seq = []
+    def make_dreamer_rollout_video(self, ds_name: str, save_path: str, context_len: int = 5, fps: int = 8, max_steps: int = 80):
+        if self.video_seq_ds is None: return None
+        
+        it = self.video_seq_ds.as_numpy_iterator()
         try:
-            first_batch = next(it)
-            obs_chunk = first_batch["observations"][0]
-            for i in range(obs_chunk.shape[0]):
-                full_gt_seq.append(torch.tensor(obs_chunk[i]))
-        except StopIteration:
-            return None
+            batch_np = next(it)
+        except StopIteration: return None
 
-        while len(full_gt_seq) < max_steps + 5:
-            try:
-                batch_np = next(it)
-                last_obs = torch.tensor(batch_np["observations"][0, -1])
-                full_gt_seq.append(last_obs)
-            except StopIteration:
-                break
+        batch = to_device(batch_np, self.device)
+        obs = batch['observations'][:, :max_steps]
+        actions = batch['actions'][:, :max_steps]
+        
+        temp = self.anneal_temp(self.train_step)
+        
+        out = self.model.visualize_diffusion_style_rollout(
+            observations=obs,
+            actions=actions,
+            temp=temp,
+            context_len=context_len
+        )
 
-        if len(full_gt_seq) < 2:
-            return None
+        pred = (out['pred_video'] + 0.5).clamp(0, 1)
+        gt = obs[0, 1:].clone().float()
+        if gt.max() > 1.0: gt /= 255.
+        if gt.min() < -0.1: gt += 0.5 
+        gt = gt.clamp(0, 1)
 
-        gt_seq = torch.stack(full_gt_seq).to(self.device)[:max_steps]
+        # len gt = len pred
+        min_t = min(pred.shape[0], gt.shape[0])
+        pred = pred[:min_t]
+        gt = gt[:min_t]
 
-        if not hasattr(self.model, "visualize_dreamer_style_rollout"):
-            return None
-        try:
-            recons = self.model.visualize_dreamer_style_rollout(gt_seq, context_len=context_len)
-        except Exception as e:
-            log(f"[DreamerVis] Error: {e}", "red")
-            return None
+        log(f"[Debug] Video Frame Count: {min_t}, Expected: {max_steps-1}", "yellow")
 
-        if recons is None or len(recons) == 0:
-            return None
+        frames = self._create_frames_from_tensors(pred, gt, context_len=context_len)
+        return self._save_video(frames, save_path, fps)
 
-        T_pred = recons.shape[0]
-        gt_match = gt_seq[1 : 1 + T_pred]  # GT frame 1.. align
-
+    def _create_frames_from_tensors(self, pred, gt, context_len=None):
         frames = []
-        self._ensure_cmap_lut("magma")
-        if self._cmap_lut.device != recons.device:
-            self._cmap_lut = self._cmap_lut.to(device=recons.device, dtype=recons.dtype)
-
-        diff_all = (recons - gt_match).abs().mean(dim=1, keepdim=True)
+        diff_all = (pred - gt).abs().mean(dim=1, keepdim=True)
         vmax = diff_all.max().clamp(min=1e-8)
-
-        def to_disp(x):
-            # [-1,1] -> [0,1]
-            return (x.clamp(-1, 1) + 1) / 2
-
-        for t in range(T_pred):
-            recon_raw = recons[t]
-            gt_raw = gt_match[t]
-
+        self._ensure_cmap_lut("magma")
+        
+        for t in range(pred.shape[0]):
+            # Error Map
             diff_t = (diff_all[t] / vmax).clamp(0, 1)
             idx = (diff_t.squeeze(0) * 255).long().clamp(0, 255)
             diff_rgb = self._cmap_lut[idx].permute(2, 0, 1)
-
-            recon_t = to_disp(recon_raw)
-            gt_t = to_disp(gt_raw)
-
-            current_step = t + 1
-            is_context = current_step < context_len
-            color = torch.tensor([0.0, 1.0, 0.0], device=recons.device) if is_context else torch.tensor([1.0, 0.0, 0.0], device=recons.device)
-            border = color.view(3, 1, 1).repeat(1, 3, recon_t.shape[2])
-            recon_t[:, :3, :] = border
-
-            tile = torch.stack([diff_rgb, recon_t, gt_t], dim=0)
-            grid = torchvision.utils.make_grid(tile, nrow=3, padding=2)
-            grid = einops.rearrange(grid, "c h w -> h w c")
-            img = (torch.clamp(grid, 0, 1).cpu().numpy() * 255).astype(np.uint8)
-            frames.append(img)
-
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with imageio.get_writer(save_path, format="mp4", fps=fps, codec="libx264", quality=8) as w:
-            for f in frames:
-                w.append_data(f)
-
-        self.log_to_wandb({f"videos/dreamer_rollout_{ds_name}": wandb.Video(save_path, fps=fps, format="mp4")})
-        return save_path
-
-    @torch.no_grad()
-    def target_vis(self, sample_dataloader):
-        batch = self._take_one_batch(sample_dataloader)
-        b = 0
-        if self.use_transformer:
-            out = self.model(batch.observations, timesteps=batch.timestep, states=batch.states)
-            pred = out.reconstructed_obs[b]   # (T-1,C,H,W)
-            gt   = batch.observations[b, 1:]  # (T-1,C,H,W)
-        else:
-            out  = self.model(batch.observations)
-            pred = out.reconstructed_obs[b][None]
-            gt   = batch.observations[b, -1:]
-
-        if self.cfg.env.n_frame_stack > 1:
-            C = pred.shape[-3]
-            pred = pred[:, C-3:C]; gt = gt[:, C-3:C]
-
-        diff = (pred - gt).abs().mean(dim=1, keepdim=True)
-
-        self._ensure_cmap_lut("magma")
-        self._cmap_lut = self._cmap_lut.to(device=pred.device, dtype=pred.dtype)
-
-        vmax = diff.max().clamp(min=1e-8)
-        tiles = []
-
-        def to_disp(x):
-            return (x.clamp(-1, 1) + 1) / 2
-
-        for t in range(pred.shape[0]):
-            diff_t = (diff[t] / vmax).clamp(0, 1)
-            idx = (diff_t.squeeze(0) * 255).round().long().clamp(0, 255)
-            diff_rgb = self._cmap_lut[idx].permute(2, 0, 1).contiguous()
-
-            pred_t = to_disp(pred[t])
-            gt_t   = to_disp(gt[t])
-
-            tiles += [diff_rgb, pred_t, gt_t]
-
-        grid = torchvision.utils.make_grid(torch.stack(tiles, dim=0), nrow=3)
-        grid = einops.rearrange(grid, "c h w -> h w c")
-        return (torch.clamp(grid, 0, 1) * 255).byte().cpu().numpy()
-
-
-    # (make_correlation_vq 등은 기존과 동일)
-    @torch.no_grad()
-    def make_correlation_vq(self, ds_names, save_path="results/vis/figure13_vq.png", max_batches=20000, max_points=500000, wandb_prefix="figures/"):
-        if isinstance(ds_names, str): ds_names = [ds_names]
-        self.model.eval()
-        all_actions_xy, all_codes, num_points = [], [], 0
-
-        for name in ds_names:
-            if hasattr(self, "eval_ds") and name in self.eval_ds: ds = self.eval_ds[name]
-            elif hasattr(self, "train_ds") and name in self.train_ds: ds = self.train_ds[name]
-            else: continue
             
-            for batch_np in ds.as_numpy_iterator():
-                if num_points >= max_points: break
-                batch = Batch(**to_device(batch_np, self.device))
-                out = self.model(batch.observations, timesteps=batch.timestep, states=batch.states)
-                idm_out = out.idm_output
-                if idm_out is None or idm_out.vq_outputs is None or "indices" not in idm_out.vq_outputs: continue
-                
-                codes = idm_out.vq_outputs["indices"][:, 1:]
-                actions = batch.actions[:, :-1, :2]
-                all_actions_xy.append(actions.detach().cpu().numpy().reshape(-1, 2))
-                all_codes.append(codes.detach().cpu().numpy().reshape(-1))
-                num_points += actions.shape[0] * actions.shape[1]
-            if num_points >= max_points: break
+            p_t, g_t = pred[t], gt[t]
+            
+            # 상상(Dreaming) 구간 표시용 테두리 (빨간색)
+            if context_len is not None and (t + 1) >= context_len:
+                p_t = p_t.clone()
+                p_t[0, :2, :] = 1.0; p_t[1:, :2, :] = 0.0 # Red border top
+            
+            tile = torch.stack([diff_rgb, p_t, g_t], dim=0)
+            grid = torchvision.utils.make_grid(tile, nrow=3)
+            img = (einops.rearrange(grid, "c h w -> h w c").cpu().numpy() * 255).astype(np.uint8)
+            frames.append(img)
+        return frames
 
-        if not all_actions_xy: return
-        actions_xy = np.concatenate(all_actions_xy, axis=0)
-        codes = np.concatenate(all_codes, axis=0)
-
-        if actions_xy.shape[0] > max_points:
-            idx = np.random.choice(actions_xy.shape[0], max_points, replace=False)
-            actions_xy = actions_xy[idx]
-            codes = codes[idx]
-
-        vocab_size = int(codes.max()) + 1
-        cmap = mcolors.ListedColormap([colorsys.hsv_to_rgb(h, 1.0, 1.0) for h in np.linspace(0, 1, vocab_size, endpoint=False)])
-        norm = mcolors.BoundaryNorm(np.arange(vocab_size + 1) - 0.5, cmap.N)
-
-        plt.figure(figsize=(8, 8))
-        plt.scatter(actions_xy[:, 0], actions_xy[:, 1], c=codes, s=4, alpha=1.0, cmap=cmap, norm=norm)
-        plt.colorbar(label="Latent Code Index")
-        plt.title(f"Latent Action Correlation (Datasets: {', '.join(ds_names)})")
-        plt.xlabel("action x"); plt.ylabel("action y"); plt.tight_layout()
+    def _save_video(self, frames, save_path, fps):
+        video_array = np.stack(frames)  # [T, H, W, C]
+        video_array = video_array.transpose(0, 3, 1, 2)  # [T, C, H, W]
         
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=200); plt.close()
-        if hasattr(self, "log_to_wandb") and os.path.exists(save_path):
-             self.log_to_wandb({f"{wandb_prefix}figure13_{'_'.join(ds_names)}": wandb.Image(save_path)})
+        return wandb.Video(video_array, fps=fps, format="mp4")
 
     def eval(self, step: int):
-        super().eval(step=step)
-        if self.cfg.joint_action_decoder_training:
-            # (Action Decoder Evaluation skipped for brevity)
-            pass
+        eval_media = {}
+        
+        actual_step =int(step)
 
-        if self.cfg.env.image_obs and not self.cfg.model.fdm.predict_target_embedding:
-            log("visualizing image reconstructions", "blue")
-            video_target = self.video_ds_name
+        if hasattr(self, 'last_vis_data'):
+            log(f"[Eval @ Step {step}] Logging Training Reconstruction Video...", "blue")
             
-            self.make_episode_video(
-                ds_name=video_target,
-                save_path="results/vis/oxe_eval_ep0.mp4",
-                fps=8,
-                max_steps=50,
+            dec = (self.last_vis_data['dec_img'] + 0.5).clamp(0, 1) 
+            raw_gt = self.last_vis_data['gt_img']
+
+            if raw_gt.min() < 0:
+                gt = (raw_gt + 0.5).clamp(0, 1)
+            else:
+                gt = raw_gt.clamp(0, 1)
+
+            log(f"DEBUG: Video T dim is {dec.shape[1]}") # 8 이하라면 1초 내외로 나옵니다.
+                        
+            num_samples = min(dec.shape[0], 4)
+            frames = []
+
+            for t in range(dec.shape[1]):
+                # 2. GT(위)와 DEC(아래)를 세로로 결합
+                # gt[0,t], gt[1,t]... 순서대로 가로로 놓기 위해 nrow 설정
+                top_row = torchvision.utils.make_grid(gt[:num_samples, t], nrow=num_samples)
+                bottom_row = torchvision.utils.make_grid(dec[:num_samples, t], nrow=num_samples)
+                
+                # 위아래로 합침 [C, H*2, W*num_samples]
+                combined_frame = torch.cat([top_row, bottom_row], dim=1)
+                
+                # 3. numpy 변환 (정확한 float -> uint8 매핑)
+                img = (combined_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                frames.append(img)
+            
+            # WandB 비디오 로깅
+            video_array = np.stack(frames) # [T, H, W, C]
+            eval_media["train/reconstruction_comparison"] = wandb.Video(
+                video_array.transpose(0, 3, 1, 2), fps=8, format="mp4"
+            )
+            del self.last_vis_data
+
+        if self.cfg.env.image_obs:
+            log(f"[Eval @ Step {step}] Generating Eval-set Videos...", "blue")
+            
+            # 1-step prediction (Reconstruction)
+            recon_path = f"results/vis/recon_step_{step}.mp4"
+            eval_media["videos/reconstruction"] = self.make_episode_video(
+                ds_name=self.video_ds_name, save_path=recon_path, fps=8, max_steps=65
             )
             
-            self.make_dreamer_rollout_video(
-                ds_name=video_target,
-                save_path="results/vis/dreamer_open_loop.mp4",
-                context_len=5,
-                fps=8,
-                max_steps=50
+            # Open-loop Rollout (Dreaming)
+            dream_path = f"results/vis/dreamer_step_{step}.mp4"
+            eval_media["videos/dreamer"] = self.make_dreamer_rollout_video(
+                ds_name=self.video_ds_name, save_path=dream_path, context_len=5, fps=8, max_steps=65
             )
 
-            try:
-                chunk_list = [f"chunk-00{i}" for i in range(5)] if "chunk" in video_target else [video_target]
-                self.make_correlation_vq(
-                    ds_names=chunk_list,
-                    save_path="results/vis/figure13_vq_chunks000_005.png",
-                    max_points=50000,
-                )
-            except Exception as e:
-                log(f"VQ Correlation visualization failed: {e}", "yellow")
+        if eval_media:
+            wandb.log(eval_media, step=actual_step, commit=False)
+        super().eval(step=actual_step)
+
+        log(f"[Eval @ Step {actual_step}] All metrics and media logged.", "green")

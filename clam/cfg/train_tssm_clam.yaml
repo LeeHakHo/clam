@@ -8,6 +8,9 @@ hp_name: ${resolve_lapa_ckpt_name:${base_hp_name}_${env.hp_name}}
 
 
 action_decoder_bs: 64
+eval_every: 300 
+log_terminal_every: 300
+save_every: 50000
 
 env:
   n_frame_stack: 1
@@ -18,7 +21,7 @@ data:
   batch_size: 8 #128
 
 model:
-  context_len: 2 #2->32 #Hayden
+  context_len: 5 #2->32 #Hayden
   la_dim: 16
   concatenate_gripper_state: False
 
@@ -33,6 +36,7 @@ model:
     H: 15
     q_trans: False
     patch_size: 32
+
     actor:
       num_units: 400
       act: "elu"
@@ -117,6 +121,21 @@ model:
     decoder:
       dec_type: "conv"
 
+  train:
+    batch_length: 100
+    batch_size: 8
+    train_steps: 50
+    train_every: 16
+    print_every_step: 300
+    log_every_step: 300.0
+    refresh_data_every: 10000.0
+    checkpoint_every_step: 50000.0
+    eval_every_step: 300.0
+    test_every_step: 1000.0
+    n_sample: 10
+    imag_last_T: False
+    log_grad: False
+
   loss:
     pcont_scale: 5.0
     kl_scale: 0.1
@@ -144,21 +163,6 @@ model:
     expl_min: 0.1
     expl_type: "epsilon_greedy"
     r_transform: "tanh"
-
-  train:
-    batch_length: 50
-    batch_size: 8
-    train_steps: 50
-    train_every: 16
-    print_every_step: 1000
-    log_every_step: 1000.0
-    refresh_data_every: 10000.0
-    checkpoint_every_step: 10000.0
-    eval_every_step: 1000.0
-    test_every_step: 1000.0
-    n_sample: 10
-    imag_last_T: False
-    log_grad: False
 
   optimize:
     warmup_iter: 64000.0

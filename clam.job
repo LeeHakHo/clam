@@ -7,12 +7,14 @@
 #SBATCH --gpus-per-task=v100:1
 #SBATCH --mem=184G
 #SBATCH --time=10:00:00
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
 #!/bin/bash 
 
 #conda create -n clam python=3.11
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate clam
+conda activate /scratch1/hyeonhoo/miniconda3/envs/my_env
 cd clam
 export WANDB_API_KEY="61a1a21df93bbb2da31d41abc3400294b59ba6eb"
 
