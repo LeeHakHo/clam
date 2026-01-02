@@ -9,7 +9,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from clam.models.mlp_policy import MLPPolicy
 from clam.models.utils.clam_utils import get_la_dim
-from clam.trainers.clam_trainer import get_clam_cls
+from clam.models.utils.clam_utils import get_clam_cls
 from clam.trainers.offline_trainer import OfflineTrainer
 from clam.utils.logger import log
 

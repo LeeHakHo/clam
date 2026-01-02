@@ -493,7 +493,7 @@ class CLAMTrainer(OfflineTrainer):
             )
 
         if eval_media:
-            wandb.log(eval_media, step=actual_step, commit=False)
+            self.wandb_run.log(eval_media, step=actual_step, commit=False)
         super().eval(step=actual_step)
 
         log(f"[Eval @ Step {actual_step}] All metrics and media logged.", "green")

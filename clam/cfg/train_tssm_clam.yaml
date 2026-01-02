@@ -8,8 +8,8 @@ hp_name: ${resolve_lapa_ckpt_name:${base_hp_name}_${env.hp_name}}
 
 
 action_decoder_bs: 64
-eval_every: 300 
-log_terminal_every: 300
+eval_every: 1000 
+log_terminal_every: 1000
 save_every: 50000
 
 env:
@@ -126,11 +126,11 @@ model:
     batch_size: 8
     train_steps: 50
     train_every: 16
-    print_every_step: 300
-    log_every_step: 300.0
+    print_every_step: 1000
+    log_every_step: 1000.0
     refresh_data_every: 10000.0
     checkpoint_every_step: 50000.0
-    eval_every_step: 300.0
+    eval_every_step: 1000.0
     test_every_step: 1000.0
     n_sample: 10
     imag_last_T: False

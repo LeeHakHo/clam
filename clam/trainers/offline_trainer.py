@@ -106,7 +106,8 @@ class OfflineTrainer(BaseTrainer):
             if hasattr(self, "action_decoder_scheduler"):
                 metrics["action_decoder_lr"] = self.action_decoder_scheduler.get_last_lr()[0]
 
-            self.log_to_wandb(metrics, prefix="train/")
+            self.log_to_wandb(metrics, prefix="train/", step=int(self.train_step + 1))
+
             if (not self.cfg.accelerate.use) or self.accelerator.is_main_process:
                 if ((self.train_step + 1) % self.eval_every) == 0:
                     self.eval(step=self.train_step + 1)
@@ -161,7 +162,7 @@ class OfflineTrainer(BaseTrainer):
             eval_metrics[k] = float(np.mean(np.array(v)))
 
         eval_metrics["time"] = time.time() - eval_time
-        self.log_to_wandb(eval_metrics, prefix="eval/")
+        self.log_to_wandb(eval_metrics, prefix="eval/", step=int(step))
 
         with open(self.log_dir / "eval.txt", "a+") as f:
             f.write(f"{step}, {eval_metrics}\n")
@@ -172,7 +173,7 @@ class OfflineTrainer(BaseTrainer):
             rollout_metrics, *_ = run_eval_rollouts(
                 cfg=self.cfg, model=self.model, wandb_run=self.wandb_run
             )
-            self.log_to_wandb(rollout_metrics, prefix="eval_rollout/")
+            self.log_to_wandb(rollout_metrics, prefix="eval_rollout/", step=int(step))
 
             with open(self.log_dir / "eval.txt", "a+") as f:
                 f.write(f"{step}, {rollout_metrics}\n")
