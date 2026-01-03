@@ -258,13 +258,35 @@ class CLAMTrainer(OfflineTrainer):
         temp = self.anneal_temp(global_step)
         model_loss, model_logs, prior_state, post_state= self.model.world_model_loss(global_step, traj_dict, temp)
         
-        metrics = {k: v for k, v in model_logs.items() if not (isinstance(v, torch.Tensor) and v.numel() > 1)}
-
         if 'dec_img' in model_logs:
             self.last_vis_data = {
             'dec_img': model_logs['dec_img'],
             'gt_img': model_logs['gt_img']
             }
+
+        metrics = {}
+        for k, v in model_logs.items():
+            # 비디오 텐서/큰 텐서는 스킵
+            if k in ("dec_img", "gt_img"):
+                continue
+
+            # dict는 평균낼 수 없으니 무조건 스킵 (ACT_prior_state 등)
+            if isinstance(v, dict):
+                continue
+
+            # torch tensor
+            if isinstance(v, torch.Tensor):
+                if v.numel() == 1:
+                    metrics[k] = float(v.detach().cpu().item())
+                continue  # numel>1 텐서는 스킵
+
+            # python / numpy scalar
+            if isinstance(v, (int, float, np.number)):
+                metrics[k] = float(v)
+                continue
+
+            # 그 외(list/ndarray/str 등)는 스킵
+            continue
 
         total_loss = model_loss
         return metrics, total_loss
@@ -337,8 +359,21 @@ class CLAMTrainer(OfflineTrainer):
             self._cmap_lut = torch.tensor(lut_np, device=self.device, dtype=torch.float32)
 
 
-    #---- Visualization---
+    def log_to_wandb(self, metrics, prefix: str = "", step: int = None):
+        if self.wandb_run is None:
+            return
 
+        if step is None:
+            if hasattr(self, "_wandb_step_override") and self._wandb_step_override is not None:
+                step = int(self._wandb_step_override)
+            else:
+                step = int(self.train_step) + 1
+
+        return super().log_to_wandb(metrics, prefix=prefix, step=step)
+
+
+
+    #---- Visualization---
     @torch.no_grad()
     def make_episode_video(self, ds_name: str, save_path: str, fps: int = 8, max_steps: int = 80):
         if self.video_seq_ds is None: return None
@@ -442,58 +477,68 @@ class CLAMTrainer(OfflineTrainer):
 
     def eval(self, step: int):
         eval_media = {}
-        
         actual_step =int(step)
 
-        if hasattr(self, 'last_vis_data'):
-            log(f"[Eval @ Step {step}] Logging Training Reconstruction Video...", "blue")
-            
-            dec = (self.last_vis_data['dec_img'] + 0.5).clamp(0, 1) 
-            raw_gt = self.last_vis_data['gt_img']
+        _saved_train_step = self.train_step
+        self.train_step = actual_step
+        self._wandb_step_override = actual_step
 
-            if raw_gt.min() < 0:
-                gt = (raw_gt + 0.5).clamp(0, 1)
-            else:
-                gt = raw_gt.clamp(0, 1)
-
-            log(f"DEBUG: Video T dim is {dec.shape[1]}")
-                        
-            num_samples = min(dec.shape[0], 4)
-            frames = []
-
-            for t in range(dec.shape[1]):
-                top_row = torchvision.utils.make_grid(gt[:num_samples, t], nrow=num_samples)
-                bottom_row = torchvision.utils.make_grid(dec[:num_samples, t], nrow=num_samples)
+        try:
+            if hasattr(self, 'last_vis_data'):
+                log(f"[Eval @ Step {step}] Logging Training Reconstruction Video...", "blue")
                 
-                combined_frame = torch.cat([top_row, bottom_row], dim=1)
+                dec = (self.last_vis_data['dec_img'] + 0.5).clamp(0, 1) 
+                raw_gt = self.last_vis_data['gt_img']
+
+                if raw_gt.min() < 0:
+                    gt = (raw_gt + 0.5).clamp(0, 1)
+                else:
+                    gt = raw_gt.clamp(0, 1)
+
+                log(f"DEBUG: Video T dim is {dec.shape[1]}")
+                            
+                num_samples = min(dec.shape[0], 4)
+                frames = []
+
+                for t in range(dec.shape[1]):
+                    top_row = torchvision.utils.make_grid(gt[:num_samples, t], nrow=num_samples)
+                    bottom_row = torchvision.utils.make_grid(dec[:num_samples, t], nrow=num_samples)
+                    
+                    combined_frame = torch.cat([top_row, bottom_row], dim=1)
+                    
+                    img = (combined_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    frames.append(img)
                 
-                img = (combined_frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                frames.append(img)
-            
-            #wandb logging
-            video_array = np.stack(frames) # [T, H, W, C]
-            eval_media["train/reconstruction_comparison"] = wandb.Video(
-                video_array.transpose(0, 3, 1, 2), fps=8, format="mp4"
-            )
-            del self.last_vis_data
+                #wandb logging
+                video_array = np.stack(frames) # [T, H, W, C]
+                eval_media["train/reconstruction_comparison"] = wandb.Video(
+                    video_array.transpose(0, 3, 1, 2), fps=8, format="mp4"
+                )
+                del self.last_vis_data
 
-        if self.cfg.env.image_obs:
-            log(f"[Eval @ Step {step}] Generating Eval-set Videos...", "blue")
-            
-            # 1-step prediction (Reconstruction)
-            recon_path = f"results/vis/recon_step_{step}.mp4"
-            eval_media["videos/reconstruction"] = self.make_episode_video(
-                ds_name=self.video_ds_name, save_path=recon_path, fps=8, max_steps=65
-            )
-            
-            # Open-loop Rollout (Dreaming)
-            dream_path = f"results/vis/dreamer_step_{step}.mp4"
-            eval_media["videos/dreamer"] = self.make_dreamer_rollout_video(
-                ds_name=self.video_ds_name, save_path=dream_path, context_len=5, fps=8, max_steps=65
-            )
+            if self.cfg.env.image_obs:
+                log(f"[Eval @ Step {step}] Generating Eval-set Videos...", "blue")
+                
+                # 1-step prediction (Reconstruction)
+                recon_path = f"results/vis/recon_step_{step}.mp4"
+                eval_media["videos/reconstruction"] = self.make_episode_video(
+                    ds_name=self.video_ds_name, save_path=recon_path, fps=8, max_steps=65
+                )
+                
+                # Open-loop Rollout (Dreaming)
+                dream_path = f"results/vis/dreamer_step_{step}.mp4"
+                eval_media["videos/dreamer"] = self.make_dreamer_rollout_video(
+                    ds_name=self.video_ds_name, save_path=dream_path, context_len=5, fps=8, max_steps=65
+                )
 
-        if eval_media:
-            self.wandb_run.log(eval_media, step=actual_step, commit=False)
-        super().eval(step=actual_step)
+            if eval_media:
+                self.wandb_run.log(eval_media, step=actual_step, commit=False)
+            out = super().eval(step=actual_step)
 
-        log(f"[Eval @ Step {actual_step}] All metrics and media logged.", "green")
+            log(f"[Eval @ Step {actual_step}] All metrics and media logged.", "green")
+            return out
+
+        finally:
+            self.train_step = _saved_train_step
+            if hasattr(self, "_wandb_step_override"):
+                delattr(self, "_wandb_step_override")

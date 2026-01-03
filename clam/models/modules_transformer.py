@@ -127,7 +127,7 @@ class TransformerWorldModel(nn.Module):
     # total loss
     model_loss = image_pred_loss + reward_pred_loss + kl_loss + pcont_loss
 
-    if global_step % self.log_every_step == 0:
+    if global_step % int(self.log_every_step) == 0:
       post_dist = Independent(OneHotCategorical(logits=post_state_trimed['logits']), 1)
       prior_dist = Independent(OneHotCategorical(logits=prior_state['logits']), 1)
       
@@ -137,16 +137,16 @@ class TransformerWorldModel(nn.Module):
         'model_reward_logprob_loss': reward_pred_loss.detach().mean().item(),
         'model_image_loss': image_pred_loss.detach().mean().item(),
         'model_mse_loss': mse_loss.mean().detach().item(),
-        #'ACT_prior_state': {k: v.detach() for k, v in prior_state.items()},
-        #'ACT_prior_entropy': prior_dist.entropy().mean().detach().item(),
-        #'ACT_post_state': {k: v.detach() for k, v in post_state.items()},
-        #'ACT_post_entropy': post_dist.entropy().mean().detach().item(),
-        #'ACT_gt_reward': reward[:, 1:],
-        #'reward_input': rnn_feature.detach(),
-        #'model_discount_logprob_loss': pcont_loss.detach().mean().item(),
-        #'discount_acc': discount_acc.detach().mean().item(),
-        #'pred_reward': pred_reward.detach().squeeze(-1),
-        #'pred_discount': pred_pcont.mean.detach().squeeze(-1),
+        'ACT_prior_state': {k: v.detach() for k, v in prior_state.items()},
+        'ACT_prior_entropy': prior_dist.entropy().mean().detach().item(),
+        'ACT_post_state': {k: v.detach() for k, v in post_state.items()},
+        'ACT_post_entropy': post_dist.entropy().mean().detach().item(),
+        'ACT_gt_reward': reward[:, 1:],
+        'reward_input': rnn_feature.detach(),
+        'model_discount_logprob_loss': pcont_loss.detach().mean().item(),
+        'discount_acc': discount_acc.detach().mean().item(),
+        'pred_reward': pred_reward.detach().squeeze(-1),
+        'pred_discount': pred_pcont.mean.detach().squeeze(-1),
         'dec_img': (image_pred_pdf.mean.detach() + 0.5),  # B, T, 3, 64, 64
         'gt_img': obs[:, 1:] + 0.5,
         'hp_kl_scale': kl_scale,
