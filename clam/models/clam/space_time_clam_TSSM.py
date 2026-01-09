@@ -22,6 +22,293 @@ from clam.models.modules_transformer import TransformerWorldModel, DenseDecoder,
 import pdb
 
 
+class SpaceTimeIDM(BaseModel):
+    def __init__(self, cfg: DictConfig, input_dim: Tuple[int, int, int], la_dim: int):
+        super().__init__(cfg=cfg, input_dim=input_dim)
+        self.name = "SpaceTimeIDM"
+
+        self.la_dim = la_dim
+        C, H, W = input_dim
+        # the 0th dimension is the channel dimension
+        self.patch_token_dim = C * self.cfg.patch_size**2
+        self.model_dim = self.cfg.net.dim_model
+
+        # the output_dim should be the latent dimension
+        # the sequence dim is [T * N]
+        # make sure H and W are divisible by patch_size
+        assert H % self.cfg.patch_size == 0 and W % self.cfg.patch_size == 0
+        self.num_patches = (H // self.cfg.patch_size) * (W // self.cfg.patch_size)
+
+        # also encode the hand position
+        if self.cfg.concatenate_gripper_state:
+            self.hand_pos_embed = nn.Linear(4, self.model_dim)
+            self.input_embed_two = nn.Linear(self.model_dim * 2, self.model_dim)
+
+        self.input_embed = nn.Linear(self.patch_token_dim, self.model_dim)
+        self.encoder = STTransformer(cfg=self.cfg.net)
+        self.activation = nn.LeakyReLU(0.2)
+
+        self.action_in = nn.Parameter(torch.randn(1, 1, 1, self.model_dim))
+
+        self.spatial_pos_embed = get_pos_encoding(
+            self.cfg.net.pos_enc, embedding_dim=self.model_dim, max_len=200
+        )
+        self.temporal_pos_embed = get_pos_encoding(
+            self.cfg.net.pos_enc, embedding_dim=self.model_dim, max_len=200
+        )
+
+        self.la_head = nn.Linear(self.model_dim, self.la_dim)
+
+    # def forward(
+    #     self, observations, timesteps: torch.Tensor, states: torch.Tensor, **kwargs
+    # ) -> IDMOutput:
+    #     if self.cfg.quantize_la:
+    #         vq_cls = get_vq_cls(self.cfg.vq.name)
+    #         log(f"Using vq {self.cfg.vq.name}", "green")
+    #         self.cfg.vq.kwargs.dim = self.cfg.la_dim
+    #         self.vq = vq_cls(**self.cfg.vq.kwargs)
+    #     else:
+    #         log("Not using vq, continuous latent action space", "red")
+
+    def forward(
+        self, observations, timesteps: torch.Tensor, states: torch.Tensor, **kwargs
+    ) -> IDMOutput:
+        """
+        Args:
+            observations: [B, T, C, H, W] tensor
+            states: [B, T, D] tensor
+        """
+        B, T, *_ = observations.shape
+
+        # need to put channel last for patchify
+        observations = observations.permute(0, 1, 3, 4, 2)
+
+        # [B, T, N, E] where N is the number of patches
+        # and E is the patch token dimension
+        patches = patchify(observations, self.cfg.patch_size)
+
+        # embed the patches
+        patches_embed = self.input_embed(patches)
+        patches_embed = self.activation(patches_embed)
+
+        # HMM, adding the action token after i embed the patches
+        if self.cfg.add_action_token:
+            B, T, N, E = patches_embed.shape
+
+            # add a dummy token to represent the latent actions
+            action_pad = self.action_in.expand(B, T, 1, self.model_dim)
+
+            # prepend the action token to the patches
+            # [B, T, N+1, E]
+            patches_embed = torch.cat([action_pad, patches_embed], dim=2)
+
+        # create temporal embeddings using timesteps
+        if self.cfg.net.pos_enc == "learned":
+            t_pos_embed = self.temporal_pos_embed(timesteps.long())
+            t_pos_embed = einops.repeat(t_pos_embed, "B T E -> B T N E", N=N + 1)
+        else:
+            t_pos_embed = None
+
+        # create spatial embeddings for each patch
+        if self.cfg.net.pos_enc == "learned":
+            spatial_coord = torch.arange(N + 1).to(patches_embed.device)
+            spatial_pos_embed = self.spatial_pos_embed(spatial_coord.long())
+            spatial_pos_embed = einops.repeat(
+                spatial_pos_embed, "N E -> B T N E", B=B, T=T
+            )
+        else:
+            spatial_pos_embed = None
+
+        pos_embed = spatial_pos_embed + t_pos_embed
+
+        if self.cfg.concatenate_gripper_state:
+            # extract the hand position and gripper state
+            # embed the hand position and concatenate with the patches
+            hand_pos_gripper = extract_state_info(states)
+            hand_pos_gripper_embed = self.hand_pos_embed(hand_pos_gripper)
+            hand_pos_gripper_embed = einops.repeat(
+                hand_pos_gripper_embed, "B T E -> B T N E", N=N + 1
+            )
+            patches_embed = self.input_embed_two(
+                torch.cat([patches_embed, hand_pos_gripper_embed], dim=-1)
+            )
+
+        # [B, T, N+1, E]
+        z = self.encoder(patches_embed, pos_embed=pos_embed, causal=False)
+
+        # reshape back to [B, T, N+1, E]
+        z = z.view(B, T, -1, self.model_dim)
+
+        if self.cfg.add_action_token:
+            # the first element is the action token
+            la_z = z[:, :, 0]
+        else:
+            la_z = z.mean(dim=2)
+
+        la = self.la_head(la_z)
+
+        # # TODO: clean this up, duplicated with regular CLAM
+        # if self.cfg.quantize_la:
+        #     quantized_la, indices, vq_loss = self.vq(la)
+
+        #     if self.cfg.use_quantized_las:  # replace la with quantized_la
+        #         la = quantized_la
+
+        #     vq_loss = vq_loss.mean()
+
+        #     vq_outputs = {"indices": indices}
+        #     vq_metrics = {
+        #         "vq_loss": vq_loss.item(),
+        #         "perplexity": compute_perplexity(
+        #             indices, self.cfg.vq.kwargs.codebook_size
+        #         ),
+        #     }
+
+        #     return IDMOutput(
+        #         la=la,
+        #         quantized_la=quantized_la,
+        #         vq_loss=vq_loss,
+        #         vq_metrics=vq_metrics,
+        #         vq_outputs=vq_outputs,
+        #         encoder_out=patches,
+        #     )
+
+        # return patches to use in the FDM
+        return IDMOutput(la=la, encoder_out=patches)
+
+
+
+class SpaceTimeFDM(BaseModel):
+    def __init__(self, cfg: DictConfig, input_dim: int, la_dim: int):
+        super().__init__(cfg, input_dim)
+        self.name = "SpaceTimeFDM"
+        C, H, W = input_dim
+        self.patch_token_dim = C * self.cfg.patch_size**2
+
+        self.num_patches = (H // self.cfg.patch_size) * (W // self.cfg.patch_size)
+        self.seq_len = (self.cfg.seq_len - 1) * self.num_patches
+        log(
+            f"Patch token dim: {self.patch_token_dim}, Num patches: {self.num_patches}, Sequence length: {self.seq_len}"
+        )
+        self.model_dim = self.cfg.net.dim_model
+
+        self.decoder = STTransformer(cfg=self.cfg.net)
+
+        self.patch_embed = nn.Linear(self.patch_token_dim, self.model_dim)
+        self.la_embed = nn.Linear(la_dim, self.model_dim)
+
+        self.spatial_pos_embed = get_pos_encoding(
+            self.cfg.net.pos_enc, embedding_dim=self.model_dim, max_len=200
+        )
+        self.temporal_pos_embed = get_pos_encoding(
+            self.cfg.net.pos_enc, embedding_dim=self.model_dim, max_len=200
+        )
+
+        self.cond_pos_embed = get_pos_encoding(
+            self.cfg.net.pos_enc, embedding_dim=self.model_dim, max_len=200
+        )
+
+        self.to_recon = nn.Linear(self.model_dim, self.patch_token_dim)
+
+        # also encode the hand position
+        if self.cfg.concatenate_gripper_state:
+            self.hand_pos_embed = nn.Linear(4, self.model_dim)
+            self.input_embed_two = nn.Linear(self.model_dim * 2, self.model_dim)
+
+    def forward(
+        self,
+        observations,
+        idm_output: IDMOutput,
+        timesteps: torch.Tensor,
+        states: torch.Tensor,
+        **kwargs,
+    ) -> CLAMOutput:
+        """
+        Args:
+            observations: [B, T, C, H, W] tensor
+            idm_output: IDMOutput
+        Returns:
+            video_recon: [B, T, C, H, W] tensor
+        """
+        B, T, C, H, W = observations.shape
+
+        # [B, T-1, la_dim]
+        la = idm_output.la[:, 1:]
+
+        # [B, T, N, E]
+        patches = idm_output.encoder_out
+
+        la_embed = self.la_embed(la)
+        # add dimension
+        la_embed = einops.rearrange(la_embed, "B T E -> B T 1 E")
+
+        # don't feed in the last timestep, need to be causal
+        patches_embed = self.patch_embed(patches[:, :-1])
+
+        video_action_patches = la_embed + patches_embed
+
+        if self.cfg.concatenate_gripper_state:
+            # extract the hand position and gripper state
+            # embed the hand position and concatenate with the patches
+            hand_pos_gripper = extract_state_info(states[:, :-1])
+            hand_pos_gripper_embed = self.hand_pos_embed(hand_pos_gripper)
+            hand_pos_gripper_embed = einops.repeat(
+                hand_pos_gripper_embed, "B T E -> B T N E", N=self.num_patches
+            )
+            video_action_patches = self.input_embed_two(
+                torch.cat([video_action_patches, hand_pos_gripper_embed], dim=-1)
+            )
+
+        B, T_minus_one, N, E = video_action_patches.shape
+
+        # create temporal embeddings using timesteps
+        if self.cfg.net.pos_enc == "learned":
+            t_pos_embed = self.temporal_pos_embed(timesteps[:, :-1].long())
+            t_pos_embed = einops.repeat(t_pos_embed, "B T E -> B T N E", N=N)
+        else:
+            t_pos_embed = None
+
+        # create spatial embeddings
+        if self.cfg.net.pos_enc == "learned":
+            spatial_coord = torch.arange(N).to(video_action_patches.device)
+            spatial_pos_embed = self.spatial_pos_embed(spatial_coord.long())
+            spatial_pos_embed = einops.repeat(
+                spatial_pos_embed, "N E -> B T N E", B=B, T=T - 1
+            )
+        else:
+            spatial_pos_embed = None
+
+        pos_embed = spatial_pos_embed + t_pos_embed
+
+        if self.cfg.net.pos_enc == "learned":
+            cond_pos_embed = self.cond_pos_embed(timesteps[:, 1:].long())
+            cond_pos_embed = einops.repeat(cond_pos_embed, "B T E -> B T N E", N=N)
+        else:
+            cond_pos_embed = None
+
+        # [B, (T-1), N, E]
+        video_recon = self.decoder(
+            video_action_patches,
+            pos_embed=pos_embed,
+            causal=True,
+            cond=la_embed,  # apply cross attention with the learned latent action
+            cond_pos_embed=cond_pos_embed,
+        )
+
+        video_recon = self.to_recon(video_recon)
+
+        # reshape back to [B, T-1, N, E]
+        video_recon = video_recon.view(B, T - 1, -1, self.patch_token_dim)
+
+        # [B, T-1, H, W, C]
+        video_recon = unpatchify(video_recon, self.cfg.patch_size, H, W)
+
+        # put channel first
+        video_recon = einops.rearrange(video_recon, "B T H W C -> B T C H W")
+        return video_recon
+
+
+
 class ActionDecoderV3Full(nn.Module):
     def __init__(
         self, 
@@ -145,72 +432,133 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         shapes = {'image': tuple(input_dim)}
 
 
-        self.pol = ActionDecoderV3Full(dense_input_size, self.action_size)
+        #self.pol = ActionDecoderV3Full(dense_input_size, self.action_size)
+
+        self.la_dim = la_dim
+        self.idm = SpaceTimeIDM(cfg.idm, input_dim=input_dim, la_dim=la_dim)
+        #self.fdm = SpaceTimeFDM(cfg.fdm, input_dim=input_dim, la_dim=la_dim)
+
+
+
+    # def forward(self, observations, timesteps: torch.Tensor, temp, state=None, gt_action=None, done=None, training=True, context_len=49):
+    #     B, T, C, H, W = observations.shape
+    #     device = observations.device
+        
+    #     obs_emb = self.world_model.dynamic.img_enc(observations / 255. - 0.5)
+    
+    #     #s_t - stacked
+    #     post_state = self.world_model.dynamic.infer_post_stoch(obs_emb, temp)
+
+    #     #action padding for first step
+    #     z_actions = torch.zeros(B, T, self.action_size, device=device)
+
+
+    #     action_logits = []
+    #     deter_list = []
+    #     for t in range(1, T):
+    #         prev_stoch = post_state['stoch'][:, :t]
+
+    #         current_action_input = gt_action[:, :t] if gt_action is not None else z_actions[:, :t]
+
+    #         #h_t
+    #         prior_step = self.world_model.dynamic.infer_prior_stoch(
+    #             prev_stoch, temp, actions=current_action_input
+    #         )
+
+    #         deter_list.append(prior_step['deter'][:, -1:])
+
+
+    #         deter_t = prior_step['deter'][:, -1] # [B, D]
+    #         stoch_t = post_state['stoch'][:, t].reshape(B, -1) # [B, N*C]
+    #         h_t = torch.cat([deter_t, stoch_t], dim=-1) 
+            
+    #         z_action_dist = self.pol(h_t)
+            
+    #         action_logits.append(z_action_dist.logits.unsqueeze(1))
+            
+    #         z_action = z_action_dist.sample() if training else z_action_dist.mode
+            
+    #         if t < T - 1:   
+    #             z_actions[:, t] = z_action
+
+    #     action_state = torch.cat(action_logits, dim=1)
+    #     all_deter = torch.cat(deter_list, dim=1)
+
+
+    #     post_state_aligned = {
+    #         'stoch': post_state['stoch'][:, 1:],  # [B, T-1, N, C]
+    #         'deter': all_deter          # [B, T-1, D]
+    #     }
+        
+    #     feat = self.world_model.dynamic.get_feature(post_state_aligned)
+    #     recon_obs = self.world_model.img_dec(feat).mean # [B, T-1, C, H, W]
+
+    #     post_state['deter'] = prior_step['deter']
+    #     post_state['o_t'] = prior_step['o_t']
+
+    #     return {
+    #         'prior_state': prior_step, # end point
+    #         'post_state': post_state,
+    #         'action_state': action_state,
+    #         'pred_action': z_actions,
+    #         'recon_obs': recon_obs
+    #     }
 
     def forward(self, observations, timesteps: torch.Tensor, temp, state=None, gt_action=None, done=None, training=True, context_len=49):
         B, T, C, H, W = observations.shape
         device = observations.device
         
-        obs_emb = self.world_model.dynamic.img_enc(observations / 255. - 0.5)
-
-        #s_t - stacked
+        # 1. Image Encoding (World Model용)
+        #obs_emb = self.world_model.dynamic.img_enc(observations / 255. - 0.5)
+        obs_emb = self.world_model.dynamic.img_enc(observations - 0.5)
+        
+        # 2. Posterior Inference (길이 T)
         post_state = self.world_model.dynamic.infer_post_stoch(obs_emb, temp)
 
-        #action padding for first step
-        z_actions = torch.zeros(B, T, self.action_size, device=device)
+        # 3. IDM을 통해 잠재 행동 추출
+        idm_output = self.idm(
+            observations=observations,
+            timesteps=timesteps,
+            states=state,
+        )
+        z_actions = idm_output.la # [B, T, la_dim]
 
+        # 4. Prior Prediction (길이 T-1)
+        prior_state = self.world_model.dynamic.infer_prior_stoch(
+            post_state['stoch'][:, :-1], 
+            temp, 
+            actions=z_actions[:, :-1]
+        )
 
-        action_logits = []
-        deter_list = []
-        for t in range(1, T):
-            prev_stoch = post_state['stoch'][:, :t]
-
-            current_action_input = gt_action[:, :t] if gt_action is not None else z_actions[:, :t]
-
-            #h_t
-            prior_step = self.world_model.dynamic.infer_prior_stoch(
-                prev_stoch, temp, actions=current_action_input
-            )
-
-            deter_list.append(prior_step['deter'][:, -1:])
-
-
-            deter_t = prior_step['deter'][:, -1] # [B, D]
-            stoch_t = post_state['stoch'][:, t].reshape(B, -1) # [B, N*C]
-            h_t = torch.cat([deter_t, stoch_t], dim=-1) 
-            
-            z_action_dist = self.pol(h_t)
-            
-            action_logits.append(z_action_dist.logits.unsqueeze(1))
-            
-            z_action = z_action_dist.sample() if training else z_action_dist.mode
-            
-            if t < T - 1:   
-                z_actions[:, t] = z_action
-
-        action_state = torch.cat(action_logits, dim=1)
-        all_deter = torch.cat(deter_list, dim=1)
-
-
-        post_state_aligned = {
-            'stoch': post_state['stoch'][:, 1:],  # [B, T-1, N, C]
-            'deter': all_deter          # [B, T-1, D]
+        # 5. 내부 Reconstruction (이미지 복원용 - 길이 T-1로 정렬)
+        # get_feature 내 cat 에러를 방지하기 위해 길이를 4(T-1)로 맞춥니다.
+        internal_aligned = {
+            'stoch': post_state['stoch'][:, 1:],
+            'logits': post_state['logits'][:, 1:],
+            'deter': prior_state['deter'],
+            'o_t': prior_state['o_t']
         }
-        
-        feat = self.world_model.dynamic.get_feature(post_state_aligned)
+        feat = self.world_model.dynamic.get_feature(internal_aligned)
         recon_obs = self.world_model.img_dec(feat).mean # [B, T-1, C, H, W]
 
-        post_state['deter'] = prior_step['deter']
-        post_state['o_t'] = prior_step['o_t']
+        post_state_for_loss = dict(post_state)
+        post_state_for_loss['deter'] = prior_state['deter']   # [B, T-1, ...]
+        post_state_for_loss['o_t']   = prior_state['o_t']     # [B, T-1, L, D]
+
+        # (선택) 다른 곳에서 “T 길이 deter/o_t”가 꼭 필요하면 별도 dict로만 제공
+        # post_state_full = dict(post_state)
+        # post_state_full['deter'] = torch.cat([prior_state['deter'][:, :1], prior_state['deter']], dim=1)  # T
+        # post_state_full['o_t']   = torch.cat([prior_state['o_t'][:, :1], prior_state['o_t']], dim=1)      # T
+
 
         return {
-            'prior_state': prior_step, # end point
-            'post_state': post_state,
-            'action_state': action_state,
+            'prior_state': prior_state,
+            'post_state': post_state_for_loss,
             'pred_action': z_actions,
-            'recon_obs': recon_obs
+            'recon_obs': recon_obs,
+            'idm_output': idm_output,
+            #'post_state_full': post_state_full,
         }
-
 
     def write_logs(self, logs, traj, global_step, writer, tag='train', min_idx=None):
         rec_img = logs['dec_img']
@@ -371,7 +719,7 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         return target, weights
 
     def policy(self, prev_obs, obs, action, gradient_step, temp, state=None, training=True, context_len=49):
-        obs = obs.unsqueeze(1) / 255. - 0.5 # B, T, C, H, W
+        obs = obs.unsqueeze(1) / 255. - 0.5 # B, T, C, H, W  #check raw_image
         obs_emb = self.world_model.dynamic.img_enc(obs) # B, T, C
         post = self.world_model.dynamic.infer_post_stoch(obs_emb, temp, action=None) # B, T, N, C
 
@@ -419,14 +767,22 @@ class SpaceTimeCLAM_TSSM(nn.Module):
 
         return action, state
 
-
     @torch.no_grad()
-    def visualize_diffusion_style_rollout(self, observations, actions, temp, context_len=5):
+    def visualize_diffusion_style_rollout(self, observations, actions, timesteps, states, temp, context_len=5):
+        # 이제 timesteps와 states를 함수 내부에서 사용할 수 있습니다.
         B, T, C, H, W = observations.shape
-        device = observations.device
         
+        # IDM 호출 시 이 인자들을 사용합니다.
+        idm_output = self.idm(
+            observations=observations,
+            timesteps=timesteps,
+            states=states,
+        )
+        z_actions = idm_output.la
+
         # 1. Image Encoding
-        obs_emb = self.world_model.dynamic.img_enc(observations / 255. - 0.5) # [B, T, D]
+        #obs_emb = self.world_model.dynamic.img_enc(observations / 255. - 0.5) # [B, T, D]
+        obs_emb = self.world_model.dynamic.img_enc(observations - 0.5) # [B, T, D]
         
         # 2. Filtering 
         post_state = self.world_model.dynamic.infer_post_stoch(obs_emb[:, :context_len], temp)
@@ -436,10 +792,10 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         
         # 3. Dreaming (Open-loop Prediction)
         for t in range(context_len, T):
-            prior_step = self.world_model.dynamic.infer_prior_stoch(
+            prior_step = self.world_model. dynamic.infer_prior_stoch(
                 torch.cat(all_stoch, dim=1), 
                 temp, 
-                actions[:, :t]
+                z_actions[:, :t]
             )
             
             next_stoch = prior_step['stoch'][:, -1:] # [B, 1, N, C]
@@ -448,7 +804,7 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         # decoding
         full_stoch_seq = torch.cat(all_stoch, dim=1) # [B, T, N, C]
         
-        act_sto_emb = self.world_model.dynamic.encode_s(full_stoch_seq[:, :-1], actions[:, 1:])
+        act_sto_emb = self.world_model.dynamic.encode_s(full_stoch_seq[:, :-1], z_actions[:, 1:])
         s_t_reshape = act_sto_emb.reshape(B, T-1, -1, 1, 1)
         o_t = self.world_model.dynamic.cell(s_t_reshape, None) 
         o_t = o_t.reshape(B, T-1, self.world_model.dynamic.n_layers, -1)

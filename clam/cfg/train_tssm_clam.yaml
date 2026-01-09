@@ -35,7 +35,7 @@ model:
     prefill: 50000
     H: 15
     q_trans: False
-    patch_size: 32
+    patch_size: 16 #Hayden 32->16
 
     actor:
       num_units: 400
@@ -54,7 +54,7 @@ model:
       reward_layer: 0 #4->1
       q_emb_action: False
       act_after_emb: False
-      rec_sigma: 1.0
+      rec_sigma: 0.5 # 1.0 -> 0.5
       anneal_world_model: False
       discrete_type: "discrete"
       std_type: "sigmoid2"
@@ -140,11 +140,11 @@ model:
     pcont_scale: 5.0
     kl_scale: 0.1
     free_nats: 0.0
-    kl_balance: 0.8
+    kl_balance: 0.6 #Hayden 0.8->0.6
     ent_scale: 0.001
 
   env:
-    action_size: 4
+    action_size: 16 #Hayden 4->16
     name: "atari_boxing"
     action_repeat: 4
     max_steps: 1000

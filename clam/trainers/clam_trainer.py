@@ -258,6 +258,25 @@ class CLAMTrainer(OfflineTrainer):
         temp = self.anneal_temp(global_step)
         model_loss, model_logs, prior_state, post_state= self.model.world_model_loss(global_step, traj_dict, temp)
         
+        raw_obs = batch.observations
+        #log(f"CHECK - Raw Obs Max: {raw_obs.max().item():.3f}, Min: {raw_obs.min().item():.3f}", "red")
+        dec_img = model_logs.get('dec_img')
+        gt_img = model_logs.get('gt_img')
+        
+        if dec_img is not None and gt_img is not None:
+            # 원본 예측값(recon)의 범위를 알기 위해 0.5를 다시 뺍니다.
+            recon_min = dec_img.min() - 0.5
+            recon_max = dec_img.max() - 0.5
+            gt_min = gt_img.min() - 0.5
+            gt_max = gt_img.max() - 0.5
+            
+            #log(f"DEBUG [Step {global_step}] Recon Range: [{recon_min:.3f}, {recon_max:.3f}]", "yellow")
+            #log(f"DEBUG [Step {global_step}] GT Range: [{gt_min:.3f}, {gt_max:.3f}]", "yellow")
+
+
+
+
+
         if 'dec_img' in model_logs:
             self.last_vis_data = {
             'dec_img': model_logs['dec_img'],
@@ -423,10 +442,12 @@ class CLAMTrainer(OfflineTrainer):
         temp = self.anneal_temp(self.train_step)
         
         out = self.model.visualize_diffusion_style_rollout(
-            observations=obs,
-            actions=actions,
+            observations=batch['observations'],
+            actions=None,  #Dummy
+            timesteps=batch['timestep'],
+            states=None, 
             temp=temp,
-            context_len=context_len
+            context_len=5
         )
 
         pred = (out['pred_video'] + 0.5).clamp(0, 1)

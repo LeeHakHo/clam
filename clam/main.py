@@ -1,4 +1,11 @@
 import os
+
+
+#Hayden, Remove this
+os.environ['SDL_VIDEODRIVER'] = 'dummy'
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
+os.environ['DISPLAY'] = ''
+
 import sys
 
 # hide warning messages

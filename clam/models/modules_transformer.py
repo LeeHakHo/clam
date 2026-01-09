@@ -74,10 +74,12 @@ class TransformerWorldModel(nn.Module):
 
   def world_model_loss(self, global_step, traj, prior_state, post_state, temp):
 
-    obs = traj[self.input_type]
-    obs = obs / 255. - 0.5
-    reward = traj['reward']
-    reward = self.r_transform(reward).float()
+    #obs = traj[self.input_type]
+    #obs = obs / 255. - 0.5
+
+    obs = traj[self.input_type].float() - 0.5
+    #reward = traj['reward']
+    #reward = self.r_transform(reward).float()
 
     post_state_trimed = {}
     for k, v in post_state.items():
@@ -90,7 +92,7 @@ class TransformerWorldModel(nn.Module):
     seq_len = self.H
 
     image_pred_pdf = self.img_dec(rnn_feature)  # B, T-1, 3, 64, 64
-    reward_pred_pdf = self.reward(rnn_feature)  # B, T-1, 1
+    #reward_pred_pdf = self.reward(rnn_feature)  # B, T-1, 1
 
     pred_pcont = self.pcont(rnn_feature)  # B, T, 1
     pcont_target = self.discount * (1. - traj['done'][:, 1:].float())  # B, T
@@ -103,9 +105,9 @@ class TransformerWorldModel(nn.Module):
     image_pred_loss = image_pred_loss.mean()
     mse_loss = (F.mse_loss(image_pred_pdf.mean, obs[:, 1:], reduction='none').flatten(start_dim=-3).sum(-1)).sum(-1) / seq_len
     mse_loss = mse_loss.mean()
-    reward_pred_loss = -(reward_pred_pdf.log_prob(reward[:, 1:].unsqueeze(2))).sum(-1) / seq_len # B
-    reward_pred_loss = reward_pred_loss.mean()
-    pred_reward = reward_pred_pdf.mean
+    #reward_pred_loss = -(reward_pred_pdf.log_prob(reward[:, 1:].unsqueeze(2))).sum(-1) / seq_len # B
+    #reward_pred_loss = reward_pred_loss.mean()
+    #pred_reward = reward_pred_pdf.mean
 
     prior_dist = self.dynamic.get_dist(prior_state, temp)
     post_dist = self.dynamic.get_dist(post_state_trimed, temp)
@@ -117,7 +119,9 @@ class TransformerWorldModel(nn.Module):
     loss_lhs = torch.maximum(value_lhs.mean(), value_lhs.new_ones(value_lhs.mean().shape) * self.free_nats)
     loss_rhs = torch.maximum(value_rhs.mean(), value_rhs.new_ones(value_rhs.mean().shape) * self.free_nats)
 
-    kl_loss = (1. - self.kl_balance) * loss_lhs + self.kl_balance * loss_rhs
+
+
+    kl_loss = (1. - self.kl_balance) * loss_lhs + self.kl_balance * loss_rhs #state dynamics KL
     kl_scale = self.kl_scale
     kl_loss = kl_scale * kl_loss
 
@@ -125,7 +129,7 @@ class TransformerWorldModel(nn.Module):
     #calculate in model
 
     # total loss
-    model_loss = image_pred_loss + reward_pred_loss + kl_loss + pcont_loss
+    model_loss = image_pred_loss + kl_loss + pcont_loss #+ reward_pred_loss
 
     if global_step % int(self.log_every_step) == 0:
       post_dist = Independent(OneHotCategorical(logits=post_state_trimed['logits']), 1)
@@ -134,18 +138,18 @@ class TransformerWorldModel(nn.Module):
       logs = {
         'model_loss': model_loss.detach().mean().item(),
         'model_kl_loss': kl_loss.detach().mean().item(),
-        'model_reward_logprob_loss': reward_pred_loss.detach().mean().item(),
+        #'model_reward_logprob_loss': reward_pred_loss.detach().mean().item(),
         'model_image_loss': image_pred_loss.detach().mean().item(),
         'model_mse_loss': mse_loss.mean().detach().item(),
         'ACT_prior_state': {k: v.detach() for k, v in prior_state.items()},
         'ACT_prior_entropy': prior_dist.entropy().mean().detach().item(),
         'ACT_post_state': {k: v.detach() for k, v in post_state.items()},
         'ACT_post_entropy': post_dist.entropy().mean().detach().item(),
-        'ACT_gt_reward': reward[:, 1:],
-        'reward_input': rnn_feature.detach(),
+        #'ACT_gt_reward': reward[:, 1:],
+        #'reward_input': rnn_feature.detach(),
         'model_discount_logprob_loss': pcont_loss.detach().mean().item(),
         'discount_acc': discount_acc.detach().mean().item(),
-        'pred_reward': pred_reward.detach().squeeze(-1),
+        #'pred_reward': pred_reward.detach().squeeze(-1),
         'pred_discount': pred_pcont.mean.detach().squeeze(-1),
         'dec_img': (image_pred_pdf.mean.detach() + 0.5),  # B, T, 3, 64, 64
         'gt_img': obs[:, 1:] + 0.5,
@@ -302,9 +306,12 @@ class TransformerDynamic(nn.Module):
       deter: GRU hidden state, B, h1
       stoch: RSSM stochastic state, B, h2
     """
+  
+    # obs = traj[self.input_type]
+    # obs = obs / 255. - 0.5
+    obs = traj[self.input_type].float() - 0.5
 
-    obs = traj[self.input_type]
-    obs = obs / 255. - 0.5
+
     obs_emb = self.img_enc(obs) # B, T, C
 
     actions = traj['action']
