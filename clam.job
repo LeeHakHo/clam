@@ -15,7 +15,7 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /scratch1/hyeonhoo/miniconda3/envs/my_env
 cd clam
-export WANDB_API_KEY="61a1a21df93bbb2da31d41abc3400294b59ba6eb"
+export WANDB_API_KEY="YOUR KEY
 
 echo "dreamer_rollout/ vq x / context_len 32"
 export PYTHONPATH=$PYTHONPATH:/scratch1/hyeonhoo/code/clam
@@ -25,7 +25,7 @@ python3 -c "import clam; print('REAL CLAM PATH:', clam.__file__)"
 nvidia-smi 
 python -c "import clam; import inspect; print(clam.__file__)"
 
-# # #Train TSSM --------------
+# Train TSSM with oxe --------------
 # python3 main.py --config-name=train_tssm_clam \
 #     env=metaworld \
 #     env.dataset_name=oxe/oxe_train\
@@ -60,7 +60,7 @@ python3 main.py --config-name=train_tssm_clam  \
     model.idm.use_quantized_las=True 
 
 
-#Train TSSM --------------
+#Train TSSM with Language table --------------
 # python3 main.py --config-name=train_tssm_clam \
 #     env=metaworld \
 #     env.dataset_name=language_table_30/samples\
@@ -100,6 +100,11 @@ python3 main.py --config-name=train_tssm_clam  \
 #     model.idm.use_quantized_las=False 
 
 
+
+
+
+
+##ST_CLAM##
 
 #Train oxe_0.1 dataset with multi-GPU-----------
 
