@@ -23,7 +23,7 @@ import pdb
 
 
 class SpaceTimeIDM(BaseModel):
-    def __init__(self, cfg: DictConfig, input_dim: Tuple[int, int, int], la_dim: int):
+    def __init__(self, cfg: DictConfig, input_dim: Tuple[int, int, int], la_dim: int, stoch_dim: int):
         super().__init__(cfg=cfg, input_dim=input_dim)
         self.name = "SpaceTimeIDM"
 
@@ -44,7 +44,10 @@ class SpaceTimeIDM(BaseModel):
             self.hand_pos_embed = nn.Linear(4, self.model_dim)
             self.input_embed_two = nn.Linear(self.model_dim * 2, self.model_dim)
 
-        self.input_embed = nn.Linear(self.patch_token_dim, self.model_dim)
+
+        #TSSM_IDM
+        self.input_embed = nn.Linear(stoch_dim, self.model_dim)
+
         self.encoder = STTransformer(cfg=self.cfg.net)
         self.activation = nn.LeakyReLU(0.2)
 
@@ -78,17 +81,19 @@ class SpaceTimeIDM(BaseModel):
             observations: [B, T, C, H, W] tensor
             states: [B, T, D] tensor
         """
-        B, T, *_ = observations.shape
+        stoch = observations['stoch']
+        B, T, N, _ = stoch.shape
 
-        # need to put channel last for patchify
-        observations = observations.permute(0, 1, 3, 4, 2)
-
-        # [B, T, N, E] where N is the number of patches
-        # and E is the patch token dimension
-        patches = patchify(observations, self.cfg.patch_size)
+        if stoch.dim() == 4:
+            stoch_flat = stoch.reshape(B, T, -1)
+        else:
+            stoch_flat = stoch 
+        
+        # 만약 패치 차원을 유지해야 한다면 (예: N=1로 처리 중일 때)
+        stoch_flat = stoch_flat.unsqueeze(2) # [B, T, 1, 1024]
 
         # embed the patches
-        patches_embed = self.input_embed(patches)
+        patches_embed = self.input_embed(stoch_flat)
         patches_embed = self.activation(patches_embed)
 
         # HMM, adding the action token after i embed the patches
@@ -105,7 +110,8 @@ class SpaceTimeIDM(BaseModel):
         # create temporal embeddings using timesteps
         if self.cfg.net.pos_enc == "learned":
             t_pos_embed = self.temporal_pos_embed(timesteps.long())
-            t_pos_embed = einops.repeat(t_pos_embed, "B T E -> B T N E", N=N + 1)
+            curr_N = patches_embed.shape[2]
+            t_pos_embed = einops.repeat(t_pos_embed, "B T E -> B T N E", N=curr_N)
         else:
             t_pos_embed = None
 
@@ -174,7 +180,7 @@ class SpaceTimeIDM(BaseModel):
         #     )
 
         # return patches to use in the FDM
-        return IDMOutput(la=la, encoder_out=patches)
+        return IDMOutput(la=la, encoder_out=stoch)
 
 
 
@@ -435,7 +441,8 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         #self.pol = ActionDecoderV3Full(dense_input_size, self.action_size)
 
         self.la_dim = la_dim
-        self.idm = SpaceTimeIDM(cfg.idm, input_dim=input_dim, la_dim=la_dim)
+        self.stoch_dim = self.stoch_size * self.stoch_discrete
+        self.idm = SpaceTimeIDM(cfg.idm, input_dim=input_dim, la_dim=la_dim, stoch_dim=self.stoch_dim)
         #self.fdm = SpaceTimeFDM(cfg.fdm, input_dim=input_dim, la_dim=la_dim)
 
 
@@ -508,30 +515,29 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         B, T, C, H, W = observations.shape
         device = observations.device
         
-        # 1. Image Encoding (World Model용)
+        # 1. Image Encoding (World Model)
         #obs_emb = self.world_model.dynamic.img_enc(observations / 255. - 0.5)
         obs_emb = self.world_model.dynamic.img_enc(observations - 0.5)
         
-        # 2. Posterior Inference (길이 T)
+        # 2. Posterior Inference (length T)
         post_state = self.world_model.dynamic.infer_post_stoch(obs_emb, temp)
 
-        # 3. IDM을 통해 잠재 행동 추출
+        # 3. IDM
         idm_output = self.idm(
-            observations=observations,
+            observations=post_state,
             timesteps=timesteps,
             states=state,
         )
         z_actions = idm_output.la # [B, T, la_dim]
 
-        # 4. Prior Prediction (길이 T-1)
+        # 4. Prior Prediction (len T-1)
         prior_state = self.world_model.dynamic.infer_prior_stoch(
             post_state['stoch'][:, :-1], 
             temp, 
             actions=z_actions[:, :-1]
         )
 
-        # 5. 내부 Reconstruction (이미지 복원용 - 길이 T-1로 정렬)
-        # get_feature 내 cat 에러를 방지하기 위해 길이를 4(T-1)로 맞춥니다.
+        # 5. Reconstruction
         internal_aligned = {
             'stoch': post_state['stoch'][:, 1:],
             'logits': post_state['logits'][:, 1:],
@@ -545,7 +551,6 @@ class SpaceTimeCLAM_TSSM(nn.Module):
         post_state_for_loss['deter'] = prior_state['deter']   # [B, T-1, ...]
         post_state_for_loss['o_t']   = prior_state['o_t']     # [B, T-1, L, D]
 
-        # (선택) 다른 곳에서 “T 길이 deter/o_t”가 꼭 필요하면 별도 dict로만 제공
         # post_state_full = dict(post_state)
         # post_state_full['deter'] = torch.cat([prior_state['deter'][:, :1], prior_state['deter']], dim=1)  # T
         # post_state_full['o_t']   = torch.cat([prior_state['o_t'][:, :1], prior_state['o_t']], dim=1)      # T
@@ -769,12 +774,14 @@ class SpaceTimeCLAM_TSSM(nn.Module):
 
     @torch.no_grad()
     def visualize_diffusion_style_rollout(self, observations, actions, timesteps, states, temp, context_len=5):
-        # 이제 timesteps와 states를 함수 내부에서 사용할 수 있습니다.
         B, T, C, H, W = observations.shape
         
-        # IDM 호출 시 이 인자들을 사용합니다.
+        obs_emb = self.world_model.dynamic.img_enc(observations - 0.5) 
+        post_state = self.world_model.dynamic.infer_post_stoch(obs_emb, temp)
+
+        # IDM
         idm_output = self.idm(
-            observations=observations,
+            observations=post_state,
             timesteps=timesteps,
             states=states,
         )

@@ -264,7 +264,7 @@ class CLAMTrainer(OfflineTrainer):
         gt_img = model_logs.get('gt_img')
         
         if dec_img is not None and gt_img is not None:
-            # 원본 예측값(recon)의 범위를 알기 위해 0.5를 다시 뺍니다.
+
             recon_min = dec_img.min() - 0.5
             recon_max = dec_img.max() - 0.5
             gt_min = gt_img.min() - 0.5
@@ -285,11 +285,11 @@ class CLAMTrainer(OfflineTrainer):
 
         metrics = {}
         for k, v in model_logs.items():
-            # 비디오 텐서/큰 텐서는 스킵
+
             if k in ("dec_img", "gt_img"):
                 continue
 
-            # dict는 평균낼 수 없으니 무조건 스킵 (ACT_prior_state 등)
+
             if isinstance(v, dict):
                 continue
 
@@ -297,14 +297,13 @@ class CLAMTrainer(OfflineTrainer):
             if isinstance(v, torch.Tensor):
                 if v.numel() == 1:
                     metrics[k] = float(v.detach().cpu().item())
-                continue  # numel>1 텐서는 스킵
+                continue  
 
-            # python / numpy scalar
+
             if isinstance(v, (int, float, np.number)):
                 metrics[k] = float(v)
                 continue
 
-            # 그 외(list/ndarray/str 등)는 스킵
             continue
 
         total_loss = model_loss
